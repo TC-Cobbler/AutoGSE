@@ -1,0 +1,10 @@
+AutoGSE bundles third-party tooling that it does not author:
+
+  - Goldberg Steam Emulator (gse_fork by alex47exe)
+    https://github.com/alex47exe/gse_fork
+    Used to generate per-game Achievement/config data and to provide the
+    emulator DLLs deployed into game folders.
+
+Please review that project's own licensing terms before redistributing
+AutoGSE publicly. This installer does not modify or relicense that tooling
+in any way; it is bundled as-is under the "gen_emu_cfg" folder.
