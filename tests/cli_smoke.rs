@@ -123,3 +123,49 @@ fn install_then_uninstall_menu_succeeds() {
     bin().arg("install-menu").assert().success();
     bin().arg("uninstall-menu").assert().success();
 }
+
+#[test]
+fn scan_reports_no_targets_under_an_empty_root() {
+    let dir = tempfile::tempdir().unwrap();
+
+    bin()
+        .args(["scan", "--root"])
+        .arg(dir.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No injectable targets found"));
+}
+
+#[test]
+fn scan_classifies_a_vanilla_subfolder() {
+    let root = tempfile::tempdir().unwrap();
+    let game_dir = root.path().join("SomeGame");
+    std::fs::create_dir_all(&game_dir).unwrap();
+    write_fake_dll(&game_dir);
+
+    bin()
+        .args(["scan", "--root"])
+        .arg(root.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[vanilla]").and(predicate::str::contains("SomeGame")));
+}
+
+#[test]
+fn inject_and_revert_reject_both_path_and_root() {
+    let dir = tempfile::tempdir().unwrap();
+
+    bin()
+        .args(["inject", "--path"])
+        .arg(dir.path())
+        .args(["--root"])
+        .arg(dir.path())
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn inject_requires_path_or_root() {
+    bin().arg("inject").assert().failure();
+}

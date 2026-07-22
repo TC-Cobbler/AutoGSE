@@ -59,6 +59,46 @@ pub fn resolve_target(path: &Path, interactive: bool) -> Result<TargetResolution
     Err(AutoGseError::DllNotFound(d_root))
 }
 
+/// One discoverable game target found under a fleet `--root` (Phase 6 §6.8).
+pub struct FleetTarget {
+    pub tod: PathBuf,
+    #[allow(dead_code)] // recorded for future diagnostics/logging, not consumed yet
+    pub dll_path: PathBuf,
+}
+
+/// Enumerates one target per immediate subdirectory of `root` — treats
+/// `root` as a games-library folder (e.g. `SteamLibrary\steamapps\common\`)
+/// whose *children* are individual game D_roots, each independently
+/// BFS-scanned to the same `MAX_DEPTH` budget `resolve_target` uses for a
+/// single game. This is deliberately **not** one BFS walk from `root`
+/// itself: a deeply-nested game (e.g. depth 6 from its own folder) would
+/// sit at depth 7+ from a shared library root and fall outside that budget,
+/// silently vanishing from the scan. Subfolders with no discoverable DLL
+/// are silently skipped — not every subfolder of a library root is
+/// necessarily a Steam game. Never prompts (unlike `resolve_target`): a
+/// non-standard DLL name in one of many targets shouldn't block scanning
+/// the rest, so those are simply skipped rather than surfaced.
+pub fn find_all_targets_under(root: &Path) -> Result<Vec<FleetTarget>, AutoGseError> {
+    if !root.is_dir() {
+        return Err(AutoGseError::TargetNotFound(root.to_path_buf()));
+    }
+
+    let mut targets = Vec::new();
+    for entry in std::fs::read_dir(root)?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let (exact, _near) = scan(&path);
+        if let Some(best) = pick_best(&exact) {
+            let tod = best.path.parent().map(Path::to_path_buf).unwrap_or_else(|| path.clone());
+            targets.push(FleetTarget { tod, dll_path: best.path });
+        }
+    }
+    targets.sort_by(|a, b| a.tod.cmp(&b.tod));
+    Ok(targets)
+}
+
 fn to_resolution(m: &DllMatch, d_root: &Path) -> TargetResolution {
     TargetResolution {
         tod: m.path.parent().map(Path::to_path_buf).unwrap_or_else(|| d_root.to_path_buf()),
@@ -283,6 +323,28 @@ mod tests {
         let result = resolve_target(&missing, false);
 
         assert!(matches!(result, Err(AutoGseError::TargetNotFound(_))));
+    }
+
+    #[test]
+    fn find_all_targets_under_discovers_one_target_per_subfolder() {
+        let root = TempDir::new().unwrap();
+        touch(&root.path().join("GameA/steam_api64.dll"));
+        touch(&root.path().join("GameB/Engine/Binaries/Win64/steam_api.dll"));
+        touch(&root.path().join("NotAGame/readme.txt"));
+
+        let mut targets = find_all_targets_under(root.path()).unwrap();
+        targets.sort_by(|a, b| a.tod.cmp(&b.tod));
+
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].tod, root.path().join("GameA"));
+        assert_eq!(targets[1].tod, root.path().join("GameB/Engine/Binaries/Win64"));
+    }
+
+    #[test]
+    fn find_all_targets_under_errors_on_nonexistent_root() {
+        let dir = TempDir::new().unwrap();
+        let missing = dir.path().join("does_not_exist");
+        assert!(matches!(find_all_targets_under(&missing), Err(AutoGseError::TargetNotFound(_))));
     }
 
     #[test]

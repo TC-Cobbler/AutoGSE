@@ -26,9 +26,21 @@ const GENERATE_EMU_CONFIG_TIMEOUT_AUTH: Duration = Duration::from_secs(180);
 /// deliberately never passed), and `-acw` re-enabled since achievement data
 /// — confirmed live to hang under anonymous login regardless of `-acw`
 /// specifically — needs a real account.
+#[derive(Clone)]
 pub enum AuthMode {
     Anonymous,
     Authenticated { username: String, password: String },
+}
+
+/// Phase 6 §6.2: controller/inventory generation are separately-billed,
+/// opt-in features (`generate_emu_config.exe`'s own `--help` confirms
+/// `-skip_con`/`-skip_inv` each independently skip one). Default (`false`
+/// for both, via `Default`) preserves the fast path Phases 3-5 already
+/// established.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GenOptions {
+    pub controller: bool,
+    pub inventory: bool,
 }
 
 /// Resolves the vendored `alex47exe/gse_fork` tools directory (`GEC_ROOT` —
@@ -54,6 +66,90 @@ pub fn tools_root() -> Result<PathBuf, AutoGseError> {
 pub fn tools_root() -> Result<PathBuf, AutoGseError> {
     let exe_dir = std::env::current_exe()?.parent().map(Path::to_path_buf).unwrap_or_default();
     let release_path = exe_dir.join("gen_emu_cfg");
+    if release_path.is_dir() {
+        Ok(release_path)
+    } else {
+        Err(AutoGseError::VendoredToolsNotFound(release_path))
+    }
+}
+
+/// Resolves the vendored `parse_controller_vdf` tool's directory (Phase 6
+/// §6.2). This is a sibling of `generate_emu_config/`, not inside it —
+/// confirmed by direct inspection of `gen_emu_cfg-Windows-Release/` — so it
+/// needs its own resolver, not `tools_root()`. **Not yet copied by the
+/// installer** (`installer/autogse.iss` only stages `generate_emu_config/*`
+/// into `gen_emu_cfg`); the installer needs a matching `Source:` line
+/// staging this into `<app>\parse_controller_vdf` for a release build to
+/// find it.
+#[cfg(debug_assertions)]
+pub fn parse_controller_vdf_root() -> Result<PathBuf, AutoGseError> {
+    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("alex47exe-gse_fork/gen_emu_cfg-Windows-Release/parse_controller_vdf");
+    if dev_path.is_dir() {
+        Ok(dev_path)
+    } else {
+        Err(AutoGseError::VendoredToolsNotFound(dev_path))
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub fn parse_controller_vdf_root() -> Result<PathBuf, AutoGseError> {
+    let exe_dir = std::env::current_exe()?.parent().map(Path::to_path_buf).unwrap_or_default();
+    let release_path = exe_dir.join("parse_controller_vdf");
+    if release_path.is_dir() {
+        Ok(release_path)
+    } else {
+        Err(AutoGseError::VendoredToolsNotFound(release_path))
+    }
+}
+
+/// Resolves the vendored **standalone** `lobby_connect_x{32,64}.exe`
+/// binaries (Phase 6 §6.7), at `alex47exe-gse_fork/release/tools/lobby_connect/`.
+/// Deliberately **not** `generate_emu_config`'s own bundled
+/// `gse_lobby_connect.exe`: direct inspection shows that's an ~80KB AutoIt
+/// "Advanced Run" launcher shim (config-driven via a sibling
+/// `gse_lobby_connect.cfg`, `RunMode=3`), the exact same broken-AutoIt-wrapper
+/// pattern already found and bypassed for `gse_generate_interfaces` and
+/// `gse_acw_helper` (see this module's and `acw.rs`'s doc comments) — not the
+/// real 5-7MB tool. **Not yet copied by the installer**, same gap as
+/// `parse_controller_vdf_root` above.
+#[cfg(debug_assertions)]
+pub fn lobby_connect_root() -> Result<PathBuf, AutoGseError> {
+    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("alex47exe-gse_fork/release/tools/lobby_connect");
+    if dev_path.is_dir() {
+        Ok(dev_path)
+    } else {
+        Err(AutoGseError::VendoredToolsNotFound(dev_path))
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub fn lobby_connect_root() -> Result<PathBuf, AutoGseError> {
+    let exe_dir = std::env::current_exe()?.parent().map(Path::to_path_buf).unwrap_or_default();
+    let release_path = exe_dir.join("lobby_connect");
+    if release_path.is_dir() {
+        Ok(release_path)
+    } else {
+        Err(AutoGseError::VendoredToolsNotFound(release_path))
+    }
+}
+
+/// Resolves the vendored `steamclient_experimental/` tree (Phase 6 §6.5), at
+/// `alex47exe-gse_fork/release/steamclient_experimental/`. **Not yet copied
+/// by the installer**, same gap as the two resolvers above.
+#[cfg(debug_assertions)]
+pub fn steamclient_experimental_root() -> Result<PathBuf, AutoGseError> {
+    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("alex47exe-gse_fork/release/steamclient_experimental");
+    if dev_path.is_dir() {
+        Ok(dev_path)
+    } else {
+        Err(AutoGseError::VendoredToolsNotFound(dev_path))
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub fn steamclient_experimental_root() -> Result<PathBuf, AutoGseError> {
+    let exe_dir = std::env::current_exe()?.parent().map(Path::to_path_buf).unwrap_or_default();
+    let release_path = exe_dir.join("steamclient_experimental");
     if release_path.is_dir() {
         Ok(release_path)
     } else {
@@ -213,6 +309,10 @@ fn tail_lines(s: &str, max_lines: usize) -> String {
 /// limitation, not a bug in this wrapper. Achievement Watcher integration
 /// (PRD §6/roadmap 3.4) is descoped from Phase 3 pending investigation.
 ///
+/// `opts` (Phase 6 §6.2) controls `-skip_con`/`-skip_inv`, each passed only
+/// when the corresponding `GenOptions` field is `false` — both default off,
+/// preserving the fast path above unless a caller opts in.
+///
 /// `gse_generate_interfaces` (PRD §5.4.1 step 2, producing `steam_interfaces.txt`)
 /// is likewise **not wired up**: it fails silently (exit 1, no output) even
 /// when staged and invoked exactly as the reference `.bat` workflow does,
@@ -221,8 +321,7 @@ fn tail_lines(s: &str, max_lines: usize) -> String {
 /// via `au3.exe /AutoIt3ExecuteScript`). Goldberg's emulator works with
 /// default interface versions without this file — it's a compatibility
 /// optimization, not a hard requirement — so this is deferred rather than
-/// blocking the core inject/revert pipeline. `-skip_con`/`-skip_inv` skip
-/// controller/inventory data as unnecessary for achievement injection.
+/// blocking the core inject/revert pipeline.
 ///
 /// `auth` selects between Phase 3's unchanged anonymous path and Phase 5's
 /// authenticated one (just omitting `-anon`, plus `-acw`; credentials
@@ -230,10 +329,24 @@ fn tail_lines(s: &str, max_lines: usize) -> String {
 /// vendored tool's own README that `GSE_CFG_USERNAME`/`GSE_CFG_PASSWORD`
 /// override a `my_login.txt` file, so AutoGSE uses only the env-var
 /// mechanism and never writes that file to disk).
-pub fn run_generate_emu_config(app_id: u64, out_dir: &Path, auth: &AuthMode) -> Result<(), AutoGseError> {
+/// Pure, directly testable mapping from `GenOptions` to the
+/// `-skip_con`/`-skip_inv` flags — split out from `run_generate_emu_config`
+/// so this logic doesn't need a real process spawn to verify.
+fn skip_flags_for(opts: GenOptions) -> Vec<&'static str> {
+    let mut flags = Vec::new();
+    if !opts.controller {
+        flags.push("-skip_con");
+    }
+    if !opts.inventory {
+        flags.push("-skip_inv");
+    }
+    flags
+}
+
+pub fn run_generate_emu_config(app_id: u64, out_dir: &Path, auth: &AuthMode, opts: GenOptions) -> Result<(), AutoGseError> {
     let exe = tools_root()?.join("generate_emu_config.exe");
     let mut cmd = Command::new(&exe);
-    cmd.args(["-rel_raw", "-clr", "-skip_con", "-skip_inv"]);
+    cmd.args(["-rel_raw", "-clr"]).args(skip_flags_for(opts));
     // `run_with_timeout` now pipes this process's stdout/stderr (to relay
     // *and* capture it) instead of leaving them inherited; a piped (non-tty)
     // stream makes CPython default to block-buffered output, which would
@@ -343,6 +456,102 @@ pub fn generate_interfaces(out_dir: &Path, arch: Arch, original_dll_path: &Path)
     Ok(true)
 }
 
+/// Runs the vendored `parse_controller_vdf.exe` against one or more
+/// hand-supplied `.vdf` files (Phase 6 §6.2's manual controller-config path
+/// — confirmed via the vendored README this is a *separate* workflow from
+/// `generate_emu_config`'s own automatic controller download, not a
+/// post-processing step of it: the README explicitly offers them as
+/// alternatives — "You can use ... `generate_emu_config` ... **Or** if you
+/// want to configure a game yourself, find the `vdf` file ... and use the
+/// tool `parse_controller_vdf`"). Confirmed via `--help` that the tool takes
+/// one or more positional `.vdf` paths and no other flags.
+///
+/// **Open empirical unknown**: the exact output filename(s)/location the
+/// tool writes its per-action-set `.txt` files to hasn't been observed
+/// against a real `.vdf` yet. This runs the tool in a scratch temp dir (the
+/// same "output relative to `current_dir`" convention `generate_interfaces`
+/// already relies on) and moves every `.txt` file that appears there into
+/// `steam_settings/controller/` — confirm this against a real vdf before
+/// relying on it, per this project's established practice of treating
+/// vendored-tool behavior as observed fact, not assumption.
+pub fn run_parse_controller_vdf(vdf_paths: &[PathBuf], tod: &Path) -> Result<Vec<String>, AutoGseError> {
+    let exe = parse_controller_vdf_root()?.join("parse_controller_vdf.exe");
+    let scratch = tempfile::Builder::new().prefix("autogse_pcv_").tempdir()?;
+
+    let mut cmd = Command::new(&exe);
+    cmd.args(vdf_paths).current_dir(scratch.path());
+    run_with_timeout(cmd, GENERATE_INTERFACES_TIMEOUT, "parse_controller_vdf.exe")?;
+
+    let dest_dir = tod.join("steam_settings").join("controller");
+    std::fs::create_dir_all(&dest_dir)?;
+    let mut written = Vec::new();
+    for entry in std::fs::read_dir(scratch.path())? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) == Some("txt") {
+            let file_name = entry.file_name();
+            std::fs::copy(&path, dest_dir.join(&file_name))?;
+            written.push(format!("steam_settings/controller/{}", file_name.to_string_lossy()));
+        }
+    }
+    Ok(written)
+}
+
+/// Spawns the correct-arch vendored `lobby_connect` binary (Phase 6 §6.7),
+/// working directory set to `tod` so its own `steam_appid.txt` discovery
+/// picks up AutoGSE's already-resolved App ID automatically. Fully inherited
+/// stdio, **no timeout** — confirmed via `--help` that this tool is a pure
+/// interactive stdin/stdout menu (not a one-shot batch job like every other
+/// external tool this module wraps), so `run_with_timeout`'s
+/// hang-detection/kill machinery doesn't apply; the call simply blocks until
+/// the user exits the tool's own menu.
+fn lobby_connect_exe_name(arch: Arch) -> &'static str {
+    match arch {
+        Arch::X86 => "lobby_connect_x32.exe",
+        Arch::X64 => "lobby_connect_x64.exe",
+    }
+}
+
+pub fn run_lobby_connect(tod: &Path, arch: Arch) -> Result<(), AutoGseError> {
+    let exe_name = lobby_connect_exe_name(arch);
+    let exe = lobby_connect_root()?.join(exe_name);
+    let status = Command::new(&exe)
+        .current_dir(tod)
+        .status()
+        .map_err(|e| AutoGseError::ExternalToolFailed { tool: exe_name.to_string(), message: format!("failed to spawn: {e}") })?;
+    if !status.success() {
+        return Err(AutoGseError::ExternalToolFailed { tool: exe_name.to_string(), message: format!("exited with {status}") });
+    }
+    Ok(())
+}
+
+/// Copies the vendored default overlay assets (font + notification sounds)
+/// from `_DEFAULT/1/steam_settings/{fonts,sounds}` into `gec_out`'s merged
+/// tree, gated on `--overlay` (Phase 6 §6.3) — these aren't referenced by
+/// any `configs.overlay.ini` key requiring their presence to *parse*, only
+/// to actually render/play, so the overlay would silently fall back to
+/// built-in defaults without them (still functional, just not what the
+/// vendored `Font_Override=Roboto-Medium.ttf` / sound-file conventions
+/// expect to find).
+///
+/// **Open empirical unknown**: not yet confirmed live whether a real
+/// `-rel_raw` `generate_emu_config.exe` run already emits these under its
+/// own `steam_settings/fonts`/`steam_settings/sounds` — this is written
+/// defensively as "only copy what's missing," so it's a no-op if the tool
+/// already provides them, and a real deployment if it doesn't.
+pub fn deploy_overlay_assets(gec_out: &Path) -> Result<(), AutoGseError> {
+    let defaults = tools_root()?.join("_DEFAULT").join("1").join("steam_settings");
+    let dest = gec_out.join("steam_settings");
+    for asset_dir in ["fonts", "sounds"] {
+        let src = defaults.join(asset_dir);
+        let dst = dest.join(asset_dir);
+        if src.is_dir() && !dst.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<(), AutoGseError> {
     std::fs::create_dir_all(dst)?;
     for entry in std::fs::read_dir(src)? {
@@ -407,6 +616,74 @@ mod tests {
         assert!(dll_source_path(Arch::X86).unwrap().is_file());
     }
 
+    #[test]
+    fn skip_flags_default_skips_both() {
+        assert_eq!(skip_flags_for(GenOptions::default()), vec!["-skip_con", "-skip_inv"]);
+    }
+
+    #[test]
+    fn skip_flags_opting_into_controller_drops_skip_con_only() {
+        assert_eq!(skip_flags_for(GenOptions { controller: true, inventory: false }), vec!["-skip_inv"]);
+    }
+
+    #[test]
+    fn skip_flags_opting_into_both_drops_both_skips() {
+        let flags = skip_flags_for(GenOptions { controller: true, inventory: true });
+        assert!(flags.is_empty());
+    }
+
+    #[test]
+    fn parse_controller_vdf_root_resolves_to_real_vendored_tree() {
+        let root = parse_controller_vdf_root().unwrap();
+        assert!(root.join("parse_controller_vdf.exe").is_file());
+    }
+
+    #[test]
+    fn lobby_connect_root_resolves_both_arch_binaries() {
+        let root = lobby_connect_root().unwrap();
+        assert!(root.join("lobby_connect_x32.exe").is_file());
+        assert!(root.join("lobby_connect_x64.exe").is_file());
+    }
+
+    #[test]
+    fn lobby_connect_exe_name_matches_real_vendored_filenames() {
+        let root = lobby_connect_root().unwrap();
+        assert!(root.join(lobby_connect_exe_name(Arch::X86)).is_file());
+        assert!(root.join(lobby_connect_exe_name(Arch::X64)).is_file());
+    }
+
+    #[test]
+    fn steamclient_experimental_root_resolves_to_real_vendored_tree() {
+        let root = steamclient_experimental_root().unwrap();
+        assert!(root.join("steamclient.dll").is_file());
+        assert!(root.join("steamclient64.dll").is_file());
+        assert!(root.join("ColdClientLoader.ini").is_file());
+        assert!(root.join("steamclient_loader_x32.exe").is_file());
+        assert!(root.join("steamclient_loader_x64.exe").is_file());
+    }
+
+
+    #[test]
+    fn deploy_overlay_assets_copies_real_vendored_fonts_and_sounds() {
+        let gec_out = TempDir::new().unwrap();
+        deploy_overlay_assets(gec_out.path()).unwrap();
+        assert!(gec_out.path().join("steam_settings/fonts").is_dir());
+        assert!(gec_out.path().join("steam_settings/sounds").is_dir());
+    }
+
+    #[test]
+    fn deploy_overlay_assets_does_not_overwrite_existing_dirs() {
+        let gec_out = TempDir::new().unwrap();
+        let fonts_dir = gec_out.path().join("steam_settings/fonts");
+        std::fs::create_dir_all(&fonts_dir).unwrap();
+        std::fs::write(fonts_dir.join("marker.txt"), b"already generated").unwrap();
+
+        deploy_overlay_assets(gec_out.path()).unwrap();
+
+        // The pre-existing (simulated already-generated) fonts dir must be
+        // left alone, not clobbered by the vendored defaults.
+        assert!(fonts_dir.join("marker.txt").is_file());
+    }
 
     #[test]
     fn generate_interfaces_returns_false_when_tool_and_archive_both_missing() {
@@ -493,7 +770,7 @@ mod tests {
     #[ignore]
     fn live_run_generate_emu_config() {
         let out_dir = TempDir::new().unwrap();
-        run_generate_emu_config(480, out_dir.path(), &AuthMode::Anonymous).unwrap(); // 480 = Spacewar, Valve's public test app
+        run_generate_emu_config(480, out_dir.path(), &AuthMode::Anonymous, GenOptions::default()).unwrap(); // 480 = Spacewar, Valve's public test app
         assert!(out_dir.path().join("steam_settings/configs.main.ini").is_file());
         assert!(out_dir.path().join("steam_settings/steam_appid.txt").is_file());
         assert!(out_dir.path().join("steam_misc/tools/au3/au3.exe").is_file());
@@ -508,7 +785,7 @@ mod tests {
         let username = std::env::var("AUTOGSE_TEST_STEAM_USERNAME").expect("set AUTOGSE_TEST_STEAM_USERNAME");
         let password = std::env::var("AUTOGSE_TEST_STEAM_PASSWORD").expect("set AUTOGSE_TEST_STEAM_PASSWORD");
         let out_dir = TempDir::new().unwrap();
-        run_generate_emu_config(105600, out_dir.path(), &AuthMode::Authenticated { username, password }).unwrap(); // 105600 = Terraria
+        run_generate_emu_config(105600, out_dir.path(), &AuthMode::Authenticated { username, password }, GenOptions::default()).unwrap(); // 105600 = Terraria
         assert!(out_dir.path().join("steam_settings/achievements.json").is_file());
         assert!(out_dir.path().join("steam_settings/img").is_dir());
     }

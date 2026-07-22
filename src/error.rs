@@ -48,6 +48,21 @@ pub enum AutoGseError {
     #[error("Achievement Watcher integration error: {0}")]
     AchievementWatcher(String),
 
+    #[error("'{0}' is not listed in this target's supported_languages.txt")]
+    UnsupportedLanguage(String),
+
+    #[error("{0} is not an injected AutoGSE target (no .gse_manifest.json) — run `inject` first")]
+    NotInjected(PathBuf),
+
+    #[error("'{0}' is not a valid overlay position (expected one of: top_left, top_center, top_right, bot_left, bot_center, bot_right)")]
+    InvalidOverlayPosition(String),
+
+    #[error("'{0}' is not a recognized --compat-flag (expected one of: achievements_bypass, disable_steamoverlaygameid_env_var, enable_steam_preowned_ids, new_app_ticket)")]
+    InvalidCompatFlag(String),
+
+    #[error("could not find a game executable under {0} to point --mode steamclient's loader at")]
+    NoGameExeFound(PathBuf),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -76,6 +91,11 @@ impl AutoGseError {
             AutoGseError::Credentials(_) => 19,
             AutoGseError::LoginFailed(_) => 20,
             AutoGseError::AchievementWatcher(_) => 21,
+            AutoGseError::UnsupportedLanguage(_) => 22,
+            AutoGseError::NotInjected(_) => 23,
+            AutoGseError::InvalidOverlayPosition(_) => 24,
+            AutoGseError::InvalidCompatFlag(_) => 25,
+            AutoGseError::NoGameExeFound(_) => 26,
         }
     }
 }
@@ -86,6 +106,10 @@ pub fn report_and_exit(err: anyhow::Error) -> ExitCode {
         .map(AutoGseError::exit_code)
         .unwrap_or(1);
     eprintln!("[AutoGSE] error: {err:#}");
+    // Best-effort — the persistent log (§6.9) is what makes a failure from a
+    // context-menu click (no visible console) diagnosable after the window
+    // closes, since the toast below is transient too.
+    let _ = crate::log::append(&format!("run: ERROR {err:#}"));
     // Context-menu-triggered runs have no visible console, so a toast is the
     // only way a failure ever reaches the user.
     crate::notify::show("AutoGSE: Error", &format!("{err:#}"));

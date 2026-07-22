@@ -107,6 +107,20 @@ pub fn delete() -> Result<(), AutoGseError> {
     delete_in(&store_dir()?)
 }
 
+/// A pure DPAPI round-trip self-test (Phase 6 §6.9's `doctor` subcommand) —
+/// touches neither the real `credentials.dat` file nor any real secret, just
+/// proves this Windows user profile's DPAPI store is reachable.
+pub fn self_test() -> Result<(), AutoGseError> {
+    const PROBE: &[u8] = b"autogse-doctor-self-test";
+    let mut plaintext = PROBE.to_vec();
+    let mut encrypted = dpapi_protect(&mut plaintext)?;
+    let decrypted = dpapi_unprotect(&mut encrypted)?;
+    if decrypted != PROBE {
+        return Err(AutoGseError::Credentials("DPAPI round-trip produced mismatched plaintext".to_string()));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -143,5 +157,10 @@ mod tests {
     fn delete_of_nonexistent_file_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         delete_in(dir.path()).unwrap();
+    }
+
+    #[test]
+    fn self_test_round_trips_successfully() {
+        self_test().unwrap();
     }
 }

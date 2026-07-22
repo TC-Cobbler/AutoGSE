@@ -40,10 +40,24 @@ pub struct GseManifest {
     /// exactly what was recorded here, nothing assumed.
     #[serde(default)]
     pub injected_files: Vec<String>,
+
+    /// `"regular"` (DLL-swap, the only mode through Phase 5) or
+    /// `"steamclient"` (Phase 6 §6.5 — `backed_up_files` stays empty for
+    /// this mode since no DLL is swapped; every staged loader file lives in
+    /// `injected_files` instead, so revert's existing logic already handles
+    /// it with no schema-specific changes). `#[serde(default)]` so a
+    /// manifest written before this field existed still loads as
+    /// `"regular"`.
+    #[serde(default = "default_mode")]
+    pub mode: String,
 }
 
 fn default_version() -> String {
     MANIFEST_VERSION.to_string()
+}
+
+fn default_mode() -> String {
+    "regular".to_string()
 }
 
 fn manifest_path(target_dir: &Path) -> PathBuf {
@@ -98,6 +112,7 @@ mod tests {
             app_id_source: Some("steam_api_fuzzy".to_string()),
             game_title: Some("Cyberpunk 2077".to_string()),
             injected_files: vec!["steam_appid.txt".to_string(), "steam_settings/configs.main.ini".to_string()],
+            mode: default_mode(),
         }
     }
 
@@ -119,14 +134,35 @@ mod tests {
         assert_eq!(loaded.arch.as_deref(), Some("x64"));
         assert_eq!(loaded.game_title.as_deref(), Some("Cyberpunk 2077"));
         assert_eq!(loaded.injected_files.len(), 2);
+        assert_eq!(loaded.mode, "regular");
 
         remove(dir.path()).unwrap();
         assert!(!exists(dir.path()));
         assert!(load(dir.path()).unwrap().is_none());
     }
 
-    /// An older sidecar written before `version`/`game_title`/`injected_files`
-    /// existed must still load without error.
+    /// Phase 6 §6.5: `steamclient` mode never swaps the DLL, so
+    /// `backed_up_files` stays empty — confirms the existing schema didn't
+    /// need a new shape for this mode, just the one `mode` field.
+    #[test]
+    fn steamclient_mode_manifest_has_empty_backed_up_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = GseManifest {
+            mode: "steamclient".to_string(),
+            backed_up_files: vec![],
+            injected_files: vec!["ColdClientLoader.ini".to_string(), "steamclient64.dll".to_string()],
+            ..sample_manifest(dir.path())
+        };
+        save(dir.path(), &manifest).unwrap();
+
+        let loaded = load(dir.path()).unwrap().unwrap();
+        assert_eq!(loaded.mode, "steamclient");
+        assert!(loaded.backed_up_files.is_empty());
+        assert_eq!(loaded.injected_files.len(), 2);
+    }
+
+    /// An older sidecar written before `version`/`game_title`/`injected_files`/
+    /// `mode` existed must still load without error.
     #[test]
     fn loads_manifest_missing_newer_fields() {
         let dir = tempfile::tempdir().unwrap();
@@ -140,6 +176,7 @@ mod tests {
         let loaded = load(dir.path()).unwrap().unwrap();
 
         assert_eq!(loaded.version, MANIFEST_VERSION);
+        assert_eq!(loaded.mode, "regular");
         assert_eq!(loaded.app_id, None);
         assert_eq!(loaded.game_title, None);
         assert!(loaded.injected_files.is_empty());

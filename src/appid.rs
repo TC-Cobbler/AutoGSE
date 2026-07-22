@@ -144,7 +144,11 @@ fn d_root_of(exe_hint: &Path) -> PathBuf {
 /// (main game binaries are reliably the largest; installers/crash-handlers
 /// are small). Revisable once Phase 4's real-game test matrix surfaces cases
 /// this gets wrong.
-fn pick_game_exe(exe_hint: &Path) -> Option<PathBuf> {
+/// Also reused by `steamclient_mode` (Phase 6 §6.5) to find the actual
+/// launchable game exe for `ColdClientLoader.ini`'s `Exe=` key — same
+/// "prefer a direct file hint, else the largest non-denylisted `.exe` in the
+/// folder" heuristic already established here for App ID PE-scraping.
+pub(crate) fn pick_game_exe(exe_hint: &Path) -> Option<PathBuf> {
     if exe_hint.is_file() {
         return Some(exe_hint.to_path_buf());
     }

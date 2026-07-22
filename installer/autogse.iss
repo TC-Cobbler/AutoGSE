@@ -1,5 +1,5 @@
 #define MyAppName "AutoGSE"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "AutoGSE Project"
 #define MyAppExeName "autogse.exe"
 
@@ -36,6 +36,13 @@ Source: "{#RepoRoot}target\release\autogse.exe"; DestDir: "{app}"; Flags: ignore
 ; Phase 3's design. Do not rename this folder without also updating that
 ; function.
 Source: "{#RepoRoot}alex47exe-gse_fork\gen_emu_cfg-Windows-Release\generate_emu_config\*"; DestDir: "{app}\gen_emu_cfg"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Phase 6 additions: these three tools are siblings of generate_emu_config/
+; in the vendored source tree, not inside it, so they need their own
+; destination folders matching goldberg.rs's matching resolver functions
+; (parse_controller_vdf_root/lobby_connect_root/steamclient_experimental_root).
+Source: "{#RepoRoot}alex47exe-gse_fork\gen_emu_cfg-Windows-Release\parse_controller_vdf\*"; DestDir: "{app}\parse_controller_vdf"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RepoRoot}alex47exe-gse_fork\release\tools\lobby_connect\*"; DestDir: "{app}\lobby_connect"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#RepoRoot}alex47exe-gse_fork\release\steamclient_experimental\*"; DestDir: "{app}\steamclient_experimental"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "install-menu"; Flags: runhidden waituntilterminated; StatusMsg: "Registering Explorer context menu..."

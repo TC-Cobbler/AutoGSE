@@ -65,7 +65,9 @@
       "Bash(./generate_interfaces64.exe \"/tmp/gi_tod/steam_api64.dll.org\")",
       "Bash(echo \"exit: $?\")",
       "Read(//c/Users/Johnny/AppData/Local/Temp/autogse_p3_smoke/Cyberpunk 2077/Engine/Binaries/Win64/**)",
-      "Read(//c/Users/Johnny/AppData/Local/Temp/autogse_p3_smoke/Cyberpunk 2077/Engine/Binaries/Win64/steam_settings/**)"
+      "Read(//c/Users/Johnny/AppData/Local/Temp/autogse_p3_smoke/Cyberpunk 2077/Engine/Binaries/Win64/steam_settings/**)",
+      "Bash(cargo run *)",
+      "Bash(git check-ignore *)"
     ],
     "additionalDirectories": [
       "c:\\Users\\Johnny\\Documents\\AutoGSE_AGProj",
