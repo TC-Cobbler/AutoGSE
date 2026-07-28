@@ -81,6 +81,12 @@ pub enum AutoGseError {
     #[error("LAN settings: {0}")]
     Lan(String),
 
+    #[error("{0} is already an AutoGSE-injected target; use --force to overwrite, or `revert` it first")]
+    AlreadyInjected(PathBuf),
+
+    #[error("invalid package: {0}")]
+    PackageInvalid(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -120,6 +126,8 @@ impl AutoGseError {
             AutoGseError::Ludusavi(_) => 30,
             AutoGseError::SaveSync(_) => 31,
             AutoGseError::Lan(_) => 32,
+            AutoGseError::AlreadyInjected(_) => 33,
+            AutoGseError::PackageInvalid(_) => 34,
         }
     }
 }

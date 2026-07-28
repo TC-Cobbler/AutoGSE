@@ -47,6 +47,11 @@ Source: "{#RepoRoot}alex47exe-gse_fork\gen_emu_cfg-Windows-Release\generate_emu_
 Source: "{#RepoRoot}alex47exe-gse_fork\gen_emu_cfg-Windows-Release\parse_controller_vdf\*"; DestDir: "{app}\parse_controller_vdf"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#RepoRoot}alex47exe-gse_fork\release\tools\lobby_connect\*"; DestDir: "{app}\lobby_connect"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#RepoRoot}alex47exe-gse_fork\release\steamclient_experimental\*"; DestDir: "{app}\steamclient_experimental"; Flags: ignoreversion recursesubdirs createallsubdirs
+; Phase 10 §10.3: Steamless (SteamStub DRM unpacker) lives at the repo root,
+; not under alex47exe-gse_fork/ — it's a separate, CC BY-NC-ND-licensed tool
+; unrelated to gse_fork's own tooling. Destination folder name must match
+; goldberg::steamless_root()'s release-mode branch.
+Source: "{#RepoRoot}Steamless\*"; DestDir: "{app}\Steamless"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Run]
 Filename: "{app}\{#MyAppExeName}"; Parameters: "install-menu"; Flags: runhidden waituntilterminated; StatusMsg: "Registering Explorer context menu..."

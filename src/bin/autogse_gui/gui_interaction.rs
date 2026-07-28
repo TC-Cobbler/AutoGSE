@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc;
 
+use autogse::anticheat::AntiCheatFinding;
 use autogse::credentials::Credentials;
 use autogse::error::AutoGseError;
 use autogse::interaction::Interaction;
@@ -154,6 +155,15 @@ impl Interaction for GuiInteraction {
 
     /// Unused by any flow wired up in `autogse-gui` yet.
     fn confirm_save_default_persona(&self) -> bool {
+        false
+    }
+
+    /// Unused by any flow wired up in `autogse-gui` yet — no inject-from-GUI
+    /// exists (see roadmap §7.0), so this never actually gets called today.
+    /// `false` (don't proceed) rather than silently swapping a DLL a real
+    /// anti-cheat scan flagged is the safe default if that ever changes
+    /// before a real GUI confirmation dialog is built for this.
+    fn confirm_anticheat_findings(&self, _findings: &[AntiCheatFinding]) -> bool {
         false
     }
 }

@@ -77,5 +77,7 @@ fn run(command: Command) -> Result<(), AutoGseError> {
         Command::ListBackups => engine::run_list_backups(),
         Command::Restore(args) => engine::run_restore(&args),
         Command::Lan(args) => engine::run_lan(&args),
+        Command::Export(args) => engine::run_export(&args),
+        Command::Import(args) => engine::run_import(&args),
     }
 }

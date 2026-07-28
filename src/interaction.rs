@@ -1,6 +1,7 @@
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
+use crate::anticheat::AntiCheatFinding;
 use crate::appid_prompt::{self, PickResult};
 use crate::credentials::Credentials;
 use crate::error::AutoGseError;
@@ -37,6 +38,11 @@ pub trait Interaction {
 
     /// Phase 6 §6.1's "save this as your default persona?" confirmation.
     fn confirm_save_default_persona(&self) -> bool;
+
+    /// Phase 10 §10.1's pre-injection anti-cheat/anti-tamper scan: `findings`
+    /// is always non-empty when this is called (the caller only prompts on a
+    /// real hit). `true` = proceed with the DLL swap anyway.
+    fn confirm_anticheat_findings(&self, findings: &[AntiCheatFinding]) -> bool;
 }
 
 /// The CLI's `Interaction` implementation — behaviorally identical to the
@@ -85,6 +91,24 @@ impl Interaction for StdioInteraction {
 
     fn confirm_save_default_persona(&self) -> bool {
         print!("[AutoGSE] Save this as your default persona for future injections? [y/N]: ");
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return false;
+        }
+        matches!(line.trim().to_lowercase().as_str(), "y" | "yes")
+    }
+
+    fn confirm_anticheat_findings(&self, findings: &[AntiCheatFinding]) -> bool {
+        println!("[AutoGSE] warning: possible anti-cheat/anti-tamper protection detected:");
+        for finding in findings {
+            println!("  - {}: {}", finding.system, finding.detail);
+        }
+        println!(
+            "[AutoGSE] Swapping steam_api(64).dll may break this protection's own integrity checks. \
+             Consider `--mode steamclient` instead, which leaves it untouched."
+        );
+        print!("[AutoGSE] Proceed with injection anyway? [y/N]: ");
         let _ = std::io::stdout().flush();
         let mut line = String::new();
         if std::io::stdin().read_line(&mut line).is_err() {

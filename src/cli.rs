@@ -131,6 +131,20 @@ pub enum Command {
     /// adding their IP/domain here so the emulator sends broadcast traffic
     /// there directly; `join` (above) remains the actual lobby-discovery UI.
     Lan(LanArgs),
+
+    /// Bundles an already-injected target's `.gse_manifest.json` and every
+    /// file it lists (`steam_settings/`, `steam_appid.txt`, ...) into a
+    /// portable zip package. Save-side achievement unlock progress is not
+    /// included — see `backup-achievements` for that.
+    Export(ExportArgs),
+
+    /// Deploys a package built by `export` onto another (already-vanilla)
+    /// copy of the same game, entirely offline: no network calls, no Steam
+    /// API lookups. Still performs a real local DLL backup+swap for
+    /// `regular`-mode packages (that step never needed the network to begin
+    /// with) — only the config-generation step `export` already did once is
+    /// skipped.
+    Import(ImportArgs),
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -231,6 +245,32 @@ pub enum LanAction {
 pub enum CliNetworkPreset {
     Default,
     CustomPort,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ExportArgs {
+    /// The already-injected game folder (must contain `.gse_manifest.json`).
+    #[arg(long)]
+    pub path: PathBuf,
+
+    /// Output package path (any filename/extension — it's a plain zip).
+    #[arg(long)]
+    pub out: PathBuf,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ImportArgs {
+    /// Package built by `export`.
+    #[arg(long)]
+    pub package: PathBuf,
+
+    /// A vanilla (not yet AutoGSE-injected) copy of the same game.
+    #[arg(long)]
+    pub path: PathBuf,
+
+    /// Overwrite an already-injected target instead of refusing.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -434,6 +474,21 @@ pub struct TargetArgs {
     /// would reject a swapped one.
     #[arg(long, value_enum, default_value_t = InjectMode::Regular)]
     pub mode: InjectMode,
+
+    /// Skip the pre-injection anti-cheat/anti-tamper scan (Easy Anti-Cheat,
+    /// BattlEye, VMProtect). Only relevant to `--mode regular` (`steamclient`
+    /// mode never swaps the DLL these protections might be watching).
+    #[arg(long = "skip-ac-scan")]
+    pub skip_ac_scan: bool,
+
+    /// Strip Valve's SteamStub DRM wrapper from the game's main executable
+    /// (via the vendored Steamless) before injecting — some SteamStub-
+    /// wrapped binaries won't run correctly once steam_api(64).dll is
+    /// swapped underneath them. Off by default: this modifies the game's
+    /// actual executable, a bigger risk than the DLL swap alone. A no-op
+    /// (not an error) when the target isn't SteamStub-protected.
+    #[arg(long = "unpack-steamstub")]
+    pub unpack_steamstub: bool,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]

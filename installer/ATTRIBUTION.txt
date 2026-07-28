@@ -5,6 +5,14 @@ AutoGSE bundles third-party tooling that it does not author:
     Used to generate per-game Achievement/config data and to provide the
     emulator DLLs deployed into game folders.
 
-Please review that project's own licensing terms before redistributing
-AutoGSE publicly. This installer does not modify or relicense that tooling
-in any way; it is bundled as-is under the "gen_emu_cfg" folder.
+  - Steamless (by atom0s)
+    https://github.com/atom0s/Steamless
+    Licensed under Creative Commons Attribution-NonCommercial-NoDerivatives
+    4.0 International (CC BY-NC-ND 4.0). Used, unmodified, as an optional
+    opt-in step (`--unpack-steamstub`) to strip Valve's SteamStub DRM
+    wrapper from a game's executable before injection. Bundled as-is under
+    the "Steamless" folder; AutoGSE never redistributes any file it unpacks.
+
+Please review each project's own licensing terms before redistributing
+AutoGSE publicly. This installer does not modify or relicense any of this
+tooling in any way; each is bundled as-is under its own named folder.

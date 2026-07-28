@@ -157,6 +157,32 @@ pub fn steamclient_experimental_root() -> Result<PathBuf, AutoGseError> {
     }
 }
 
+/// Resolves the vendored `Steamless/` tree (Phase 10 §10.3) — SteamStub DRM
+/// unpacking, unrelated to `gse_fork`'s own tooling above, so it lives at the
+/// repo root as `Steamless/`, not under `alex47exe-gse_fork/`. Same
+/// dev-vs-release split as every other resolver here; the installer needs a
+/// matching `Source:` line staging this into `<app>\Steamless`.
+#[cfg(debug_assertions)]
+pub fn steamless_root() -> Result<PathBuf, AutoGseError> {
+    let dev_path = Path::new(env!("CARGO_MANIFEST_DIR")).join("Steamless");
+    if dev_path.is_dir() {
+        Ok(dev_path)
+    } else {
+        Err(AutoGseError::VendoredToolsNotFound(dev_path))
+    }
+}
+
+#[cfg(not(debug_assertions))]
+pub fn steamless_root() -> Result<PathBuf, AutoGseError> {
+    let exe_dir = std::env::current_exe()?.parent().map(Path::to_path_buf).unwrap_or_default();
+    let release_path = exe_dir.join("Steamless");
+    if release_path.is_dir() {
+        Ok(release_path)
+    } else {
+        Err(AutoGseError::VendoredToolsNotFound(release_path))
+    }
+}
+
 /// Resolves the real Goldberg emulator DLL matching `arch`, from the
 /// vendored `_DEFAULT/0/` base payload (confirmed by direct inspection to be
 /// the actual emulator binaries, not a placeholder).

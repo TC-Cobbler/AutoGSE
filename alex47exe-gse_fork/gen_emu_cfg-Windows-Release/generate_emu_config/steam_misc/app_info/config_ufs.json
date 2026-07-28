@@ -1,0 +1,5 @@
+{
+  "sync_while_suspended": "1",
+  "quota": "4096",
+  "maxnumfiles": "10"
+}

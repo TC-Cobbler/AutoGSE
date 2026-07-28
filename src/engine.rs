@@ -10,12 +10,13 @@ use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::acw;
+use crate::anticheat;
 use crate::appid::{self, AppIdContext};
 use crate::backup;
 use crate::backup_manager;
 use crate::cli::{
-    AddModArgs, BackupAchievementsArgs, CliNetworkPreset, ConfigureOverlayArgs, DeployRealGlyphsArgs, InjectMode, JoinArgs, LanAction, LanArgs,
-    ParseControllerVdfArgs, RestoreArgs, ScanArgs, SyncDirection, SyncSavesArgs, TargetArgs,
+    AddModArgs, BackupAchievementsArgs, CliNetworkPreset, ConfigureOverlayArgs, DeployRealGlyphsArgs, ExportArgs, ImportArgs, InjectMode, JoinArgs,
+    LanAction, LanArgs, ParseControllerVdfArgs, RestoreArgs, ScanArgs, SyncDirection, SyncSavesArgs, TargetArgs,
 };
 use crate::controller_glyphs;
 use crate::credentials;
@@ -32,6 +33,7 @@ use crate::mods;
 use crate::mutex_engine::AutoGseLock;
 use crate::notify;
 use crate::output::Output;
+use crate::package;
 use crate::pe;
 use crate::preferences;
 use crate::process_lock;
@@ -513,6 +515,99 @@ pub fn run_lan(args: &LanArgs) -> Result<(), AutoGseError> {
     Ok(())
 }
 
+pub fn run_export(args: &ExportArgs) -> Result<(), AutoGseError> {
+    let resolution = discovery::resolve_target(&args.path, None)?;
+    let Some(manifest) = manifest::load(&resolution.tod)? else {
+        return Err(AutoGseError::NotInjected(resolution.tod));
+    };
+
+    package::export_package(&resolution.tod, &manifest, &args.out)?;
+    println!(
+        "[AutoGSE] Exported {} to {} ({} file(s)).",
+        resolution.tod.display(),
+        args.out.display(),
+        manifest.injected_files.len() + 1
+    );
+    Ok(())
+}
+
+/// Deploys a package built by `run_export` onto `<P>` entirely offline —
+/// `<P>` must already contain the vanilla game (same precondition
+/// `resolve_target` enforces for a real `inject`), and this performs the
+/// real local DLL backup+swap itself for `regular`-mode packages (that step
+/// never needed a network call in the first place; only the
+/// `generate_emu_config.exe` config-generation `export` already captured is
+/// skipped here). `--force` overwrites an already-injected target instead of
+/// refusing.
+pub fn run_import(args: &ImportArgs) -> Result<(), AutoGseError> {
+    let d_root = discovery::compute_d_root(&args.path)?;
+    let _lock = AutoGseLock::acquire(&d_root, LOCK_TIMEOUT_MS)?;
+
+    let resolution = discovery::resolve_target(&args.path, None)?;
+
+    if manifest::exists(&resolution.tod) && !args.force {
+        return Err(AutoGseError::AlreadyInjected(resolution.tod));
+    }
+
+    let imported = package::extract_package(&args.package)?;
+    let arch = pe::read_bitness(&resolution.dll_path)?;
+
+    // Mirrors `run_inject_single`'s own backup/swap block, minus the
+    // App-ID/generate_emu_config network step this package already carries
+    // the output of. `steamclient`-mode packages never touch this DLL at
+    // all, same as a real `steamclient`-mode inject.
+    let backed_up_opt = if imported.manifest.mode == "regular" {
+        if process_lock::is_file_locked(&resolution.dll_path) {
+            return Err(AutoGseError::ProcessRunning(format!(
+                "{} is in use by another process (likely the game is running); close it and try again",
+                resolution.dll_path.display()
+            )));
+        }
+        let dll_src = goldberg::dll_source_path(arch)?;
+        let backed_up = backup::ensure_backed_up(&resolution.dll_path)?;
+        backup::atomic_copy(&dll_src, &resolution.dll_path)?;
+        Some(backed_up)
+    } else {
+        None
+    };
+
+    let existing_settings = resolution.tod.join("steam_settings");
+    if existing_settings.is_dir() {
+        backup::backup_existing_dir(&existing_settings)?;
+    }
+
+    package::copy_extracted_files(imported.extracted_dir.path(), &resolution.tod, &imported.manifest.injected_files)?;
+
+    let manifest = GseManifest {
+        version: manifest::MANIFEST_VERSION.to_string(),
+        timestamp: unix_timestamp(),
+        target_directory: resolution.tod.to_string_lossy().into_owned(),
+        backed_up_files: backed_up_opt.into_iter().collect(),
+        app_id: imported.manifest.app_id,
+        // Re-derived locally rather than trusting the package's own
+        // (export-machine) value — the freshly-detected real DLL on this
+        // machine is authoritative, same principle `run_inject_single`
+        // already applies to `steam_appid.txt`.
+        arch: Some(arch.to_string()),
+        app_id_source: imported.manifest.app_id_source.clone(),
+        game_title: imported.manifest.game_title.clone(),
+        injected_files: imported.manifest.injected_files.clone(),
+        mode: imported.manifest.mode.clone(),
+    };
+    manifest::save(&resolution.tod, &manifest)?;
+    index::record(&resolution.tod)?;
+
+    println!(
+        "[AutoGSE] Imported {} onto {} (AppID {:?}, mode {}).",
+        args.package.display(),
+        resolution.tod.display(),
+        manifest.app_id,
+        manifest.mode
+    );
+    notify::show("AutoGSE: Import Complete", &format!("Imported configuration onto {}.", resolution.tod.display()));
+    Ok(())
+}
+
 /// Resolves which Steam access mode `run_inject_single` should use, per
 /// roadmap.md Phase 5: login is the default once configured, `--anon` is
 /// always honored as an explicit opt-out, and a first-run machine (neither
@@ -818,6 +913,42 @@ fn run_inject_single(
 
     let arch = pe::read_bitness(&resolution.dll_path)?;
 
+    // Phase 10 §10.1: advisory, `regular`-mode-only pre-injection scan —
+    // `steamclient` mode never swaps `steam_api(64).dll` in the first place,
+    // so a finding there would be about a DLL this run isn't touching.
+    // Deliberately runs before anything below mutates the game folder, same
+    // reasoning as the vendored-tools resolution a few lines down.
+    if args.mode == InjectMode::Regular && !args.skip_ac_scan {
+        let mut findings = anticheat::scan_directory(&resolution.tod);
+        if let Some(game_exe) = appid::pick_game_exe(path) {
+            findings.extend(anticheat::scan_binary(&game_exe));
+        }
+        if !findings.is_empty() {
+            let summary: Vec<String> = findings.iter().map(|f| f.system.to_string()).collect();
+            if interactive {
+                if !interaction.confirm_anticheat_findings(&findings) {
+                    out.info("Injection cancelled after anti-cheat scan.");
+                    return Ok(());
+                }
+            } else {
+                out.warn(format!(
+                    "Anti-cheat/anti-tamper protection detected ({}) — proceeding anyway under --silent. \
+                     Re-run without --silent to review, or pass --skip-ac-scan to suppress this check.",
+                    summary.join(", ")
+                ));
+                let _ = crate::log::append(&format!(
+                    "inject: anti-cheat scan flagged {} at {} (--silent, proceeded anyway)",
+                    summary.join(", "),
+                    resolution.tod.display()
+                ));
+                notify::show(
+                    "AutoGSE: Anti-Cheat Detected",
+                    &format!("{} detected at {} — injected anyway (--silent).", summary.join(", "), resolution.tod.display()),
+                );
+            }
+        }
+    }
+
     // Resolved (and validated) before anything below mutates the game
     // folder: a missing-vendored-tools failure must never happen *after*
     // ensure_backed_up has already renamed the original DLL away, which
@@ -859,6 +990,35 @@ fn run_inject_single(
     } else {
         None
     };
+
+    // Phase 10 §10.3: opt-in SteamStub unpack, independent of the DLL
+    // backup/swap above — a different file (the game's main exe, not
+    // steam_api(64).dll), backed up and swapped the exact same
+    // rename-to-`.org`-then-atomic-copy way, so it needs no new manifest
+    // schema, just a second `BackedUpFile` entry alongside the DLL's (kept
+    // separate from `backed_up_opt` rather than merged immediately: the
+    // interfaces-generation step further down specifically needs *the DLL's*
+    // backup entry, not just "whichever backup happened first").
+    let mut steamless_backed_up: Option<BackedUpFile> = None;
+    if args.unpack_steamstub {
+        let game_exe = appid::pick_game_exe(path).ok_or_else(|| AutoGseError::NoGameExeFound(resolution.tod.clone()))?;
+        match crate::steamless::unpack(&game_exe) {
+            Ok(Some(unpacked)) => {
+                let backed_up = backup::ensure_backed_up(&game_exe)?;
+                backup::atomic_copy(&unpacked, &game_exe)?;
+                // Steamless writes `unpacked` beside the original exe's own
+                // location; it's now been copied into place, so the sibling
+                // is a redundant leftover, not tracked by the manifest.
+                let _ = std::fs::remove_file(&unpacked);
+                steamless_backed_up = Some(backed_up);
+                out.info(format!("Unpacked SteamStub DRM from {}.", game_exe.display()));
+            }
+            Ok(None) => {
+                out.info(format!("{} is not SteamStub-protected (nothing to unpack).", game_exe.display()));
+            }
+            Err(e) => return Err(e),
+        }
+    }
 
     let auth_mode = match preresolved_auth {
         Some(mode) => mode,
@@ -988,7 +1148,7 @@ fn run_inject_single(
         version: manifest::MANIFEST_VERSION.to_string(),
         timestamp: unix_timestamp(),
         target_directory: resolution.tod.to_string_lossy().into_owned(),
-        backed_up_files: backed_up_opt.into_iter().collect(),
+        backed_up_files: backed_up_opt.into_iter().chain(steamless_backed_up).collect(),
         app_id: Some(app_id_resolution.app_id),
         arch: Some(arch.to_string()),
         app_id_source: Some(app_id_resolution.source.as_str().to_string()),
