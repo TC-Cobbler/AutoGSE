@@ -1,8 +1,8 @@
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use crate::appid_prompt;
 use crate::error::AutoGseError;
+use crate::interaction::Interaction;
 use crate::sanitize;
 use crate::steam_api::{self, ScoredCandidate};
 use crate::version_info;
@@ -19,7 +19,10 @@ pub struct AppIdContext<'a> {
     /// used to find the *game's* exe for Steps 2/3, distinct from `tod`.
     pub exe_hint: &'a Path,
     pub override_appid: Option<u64>,
-    pub interactive: bool,
+    /// `None` reproduces the old `interactive: false` behavior exactly
+    /// (Step 5 becomes a hard error instead of prompting) — see Phase 7
+    /// §7.0's `Interaction` abstraction.
+    pub interaction: Option<&'a dyn Interaction>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,13 +101,13 @@ where
         }
     }
 
-    if !ctx.interactive {
+    let Some(interaction) = ctx.interaction else {
         return Err(AutoGseError::AppIdResolutionFailed(
             "no confident automatic match and interactive prompt disabled (--silent)".to_string(),
         ));
-    }
+    };
 
-    let (app_id, game_title) = appid_prompt::prompt_app_id_disambiguation_stdio(ctx.tod, &candidates)?;
+    let (app_id, game_title) = interaction.disambiguate_app_id(ctx.tod, &candidates)?;
     Ok(AppIdResolution { app_id, source: AppIdSource::Manual, game_title })
 }
 
@@ -194,7 +197,7 @@ mod tests {
     #[test]
     fn override_short_circuits_everything() {
         let dir = TempDir::new().unwrap();
-        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: Some(1245620), interactive: false };
+        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: Some(1245620), interaction: None };
 
         let resolution = resolve_app_id_with(&ctx, unreachable_lookup).unwrap();
 
@@ -206,7 +209,7 @@ mod tests {
     fn step1_finds_direct_steam_appid_txt() {
         let dir = TempDir::new().unwrap();
         touch(&dir.path().join("steam_appid.txt"), b"1091500\n");
-        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interactive: false };
+        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interaction: None };
 
         let resolution = resolve_app_id_with(&ctx, unreachable_lookup).unwrap();
 
@@ -218,7 +221,7 @@ mod tests {
     fn step1_finds_steam_settings_subfolder_variant() {
         let dir = TempDir::new().unwrap();
         touch(&dir.path().join("steam_settings/steam_appid.txt"), b"367520");
-        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interactive: false };
+        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interaction: None };
 
         let resolution = resolve_app_id_with(&ctx, unreachable_lookup).unwrap();
 
@@ -231,7 +234,7 @@ mod tests {
         touch(&dir.path().join("steam_appid.txt"), b"55");
         let nested_tod = dir.path().join("Engine/Binaries/Win64");
         std::fs::create_dir_all(&nested_tod).unwrap();
-        let ctx = AppIdContext { tod: &nested_tod, exe_hint: dir.path(), override_appid: None, interactive: false };
+        let ctx = AppIdContext { tod: &nested_tod, exe_hint: dir.path(), override_appid: None, interaction: None };
 
         let resolution = resolve_app_id_with(&ctx, unreachable_lookup).unwrap();
 
@@ -241,7 +244,7 @@ mod tests {
     #[test]
     fn step4_high_confidence_match_resolves_without_prompting() {
         let dir = TempDir::new().unwrap();
-        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interactive: false };
+        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interaction: None };
 
         let resolution = resolve_app_id_with(&ctx, |_name| {
             vec![ScoredCandidate { appid: 1091500, name: "Cyberpunk 2077".to_string(), score: 0.95 }]
@@ -255,7 +258,7 @@ mod tests {
     #[test]
     fn low_confidence_match_and_non_interactive_is_an_error() {
         let dir = TempDir::new().unwrap();
-        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interactive: false };
+        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interaction: None };
 
         let result = resolve_app_id_with(&ctx, |_name| {
             vec![ScoredCandidate { appid: 999, name: "Something Unrelated".to_string(), score: 0.40 }]
@@ -267,7 +270,7 @@ mod tests {
     #[test]
     fn no_candidates_and_non_interactive_is_an_error() {
         let dir = TempDir::new().unwrap();
-        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interactive: false };
+        let ctx = AppIdContext { tod: dir.path(), exe_hint: dir.path(), override_appid: None, interaction: None };
 
         let result = resolve_app_id_with(&ctx, |_name| Vec::new());
 

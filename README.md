@@ -46,7 +46,7 @@ On first use (if no credentials are stored yet and no anonymous preference is se
 
 ## Building from source
 
-Requires the Rust toolchain (`x86_64-pc-windows-msvc`) and Inno Setup (for the installer only).
+Requires the gen_emu_cfg-Windows-Release from https://github.com/alex47exe/gse_fork_tools/releases, Rust toolchain (`x86_64-pc-windows-msvc`) and Inno Setup (for the installer only).
 
 ```bash
 cargo build --release

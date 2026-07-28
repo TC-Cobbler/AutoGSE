@@ -2,8 +2,8 @@ use std::collections::VecDeque;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-use crate::appid_prompt::{self, PickResult};
 use crate::error::AutoGseError;
+use crate::interaction::Interaction;
 
 /// BFS depth cap beneath D_root (PRD §5.2.1).
 const MAX_DEPTH: usize = 6;
@@ -40,8 +40,10 @@ pub fn compute_d_root(path: &Path) -> Result<PathBuf, AutoGseError> {
 /// Resolves a right-clicked file/folder to its Target Operating Directory and
 /// the Steam API DLL within it (PRD §5.2). Replaces Phase 1's naive
 /// `resolve_target_dir`/`find_target_dll` stand-ins with the real recursive
-/// BFS discovery engine.
-pub fn resolve_target(path: &Path, interactive: bool) -> Result<TargetResolution, AutoGseError> {
+/// BFS discovery engine. `interaction` gates the non-standard-DLL-name
+/// fallback prompt (Phase 7 §7.0): `None` behaves exactly like the old
+/// `interactive: false` (never prompts, falls straight to `DllNotFound`).
+pub fn resolve_target(path: &Path, interaction: Option<&dyn Interaction>) -> Result<TargetResolution, AutoGseError> {
     let d_root = compute_d_root(path)?;
 
     let (exact, near) = scan(&d_root);
@@ -50,9 +52,11 @@ pub fn resolve_target(path: &Path, interactive: bool) -> Result<TargetResolution
         return Ok(to_resolution(&best, &d_root));
     }
 
-    if !near.is_empty() && interactive {
-        if let Some(resolution) = prompt_non_standard_name(&near, &d_root) {
-            return Ok(resolution);
+    if !near.is_empty() {
+        if let Some(interaction) = interaction {
+            if let Some(resolution) = prompt_non_standard_name(&near, &d_root, interaction) {
+                return Ok(resolution);
+            }
         }
     }
 
@@ -109,31 +113,17 @@ fn to_resolution(m: &DllMatch, d_root: &Path) -> TargetResolution {
 
 /// PRD §8's "non-standard/renamed DLL name" edge case: offers a manual pick
 /// among near-miss `.dll` files (e.g. `steam_api64_orig.dll`), or a fully
-/// manual path entry. Returns `None` on cancel/EOF so the caller falls back
-/// to the ordinary `DllNotFound` error.
-fn prompt_non_standard_name(near: &[DllMatch], d_root: &Path) -> Option<TargetResolution> {
-    let options: Vec<String> = near.iter().map(|m| m.path.display().to_string()).collect();
-    let mut stdin = std::io::stdin().lock();
-    let mut stdout = std::io::stdout();
-
-    match appid_prompt::pick_from_list(
-        &mut stdin,
-        &mut stdout,
-        "AutoGSE - Non-Standard Steam DLL Detected",
-        &options,
-        Some("Enter DLL path manually"),
-    ) {
-        PickResult::Selected(i) => near.get(i).map(|m| to_resolution(m, d_root)),
-        PickResult::Manual(value) => {
-            let manual_path = PathBuf::from(value);
-            if manual_path.is_file() {
-                Some(to_resolution(&DllMatch { path: manual_path, depth: 0 }, d_root))
-            } else {
-                None
-            }
-        }
-        PickResult::Cancelled => None,
-    }
+/// manual path entry, via the caller-supplied `Interaction`. Returns `None`
+/// on cancel/EOF so the caller falls back to the ordinary `DllNotFound`
+/// error.
+fn prompt_non_standard_name(near: &[DllMatch], d_root: &Path, interaction: &dyn Interaction) -> Option<TargetResolution> {
+    let paths: Vec<PathBuf> = near.iter().map(|m| m.path.clone()).collect();
+    let picked = interaction.pick_dll(&paths, d_root)?;
+    // Preserve the real depth when the picked path was one of the scanned
+    // near-matches (list selection); a manually-typed path has no scanned
+    // depth to recover, so it defaults to 0.
+    let depth = near.iter().find(|m| m.path == picked).map(|m| m.depth).unwrap_or(0);
+    Some(to_resolution(&DllMatch { path: picked, depth }, d_root))
 }
 
 /// BFS beneath `d_root` to `MAX_DEPTH`, collecting exact `steam_api(64).dll`
@@ -208,7 +198,7 @@ mod tests {
         touch(&dir.path().join("Cyberpunk.exe"));
         touch(&dir.path().join("Engine/Binaries/Win64/steam_api64.dll"));
 
-        let resolution = resolve_target(&dir.path().join("Cyberpunk.exe"), false).unwrap();
+        let resolution = resolve_target(&dir.path().join("Cyberpunk.exe"), None).unwrap();
 
         assert_eq!(resolution.tod, dir.path().join("Engine/Binaries/Win64"));
         assert_eq!(resolution.depth, 3);
@@ -220,7 +210,7 @@ mod tests {
         touch(&dir.path().join("HollowKnight.exe"));
         touch(&dir.path().join("steam_api.dll"));
 
-        let resolution = resolve_target(&dir.path().join("HollowKnight.exe"), false).unwrap();
+        let resolution = resolve_target(&dir.path().join("HollowKnight.exe"), None).unwrap();
 
         assert_eq!(resolution.tod, dir.path().to_path_buf());
         assert_eq!(resolution.depth, 0);
@@ -232,7 +222,7 @@ mod tests {
         touch(&dir.path().join("RE2.exe"));
         touch(&dir.path().join("steam_api64.dll"));
 
-        let resolution = resolve_target(&dir.path().join("RE2.exe"), false).unwrap();
+        let resolution = resolve_target(&dir.path().join("RE2.exe"), None).unwrap();
 
         assert_eq!(resolution.tod, dir.path().to_path_buf());
     }
@@ -243,7 +233,7 @@ mod tests {
         touch(&dir.path().join("Launcher.exe"));
         touch(&dir.path().join("bin/x64/steam_api64.dll"));
 
-        let resolution = resolve_target(&dir.path().join("Launcher.exe"), false).unwrap();
+        let resolution = resolve_target(&dir.path().join("Launcher.exe"), None).unwrap();
 
         assert_eq!(resolution.tod, dir.path().join("bin/x64"));
     }
@@ -254,7 +244,7 @@ mod tests {
         touch(&dir.path().join("steam_api64.dll")); // decoy at depth 0
         touch(&dir.path().join("Engine/Binaries/Win64/steam_api64.dll")); // real, depth 3
 
-        let resolution = resolve_target(dir.path(), false).unwrap();
+        let resolution = resolve_target(dir.path(), None).unwrap();
 
         assert_eq!(resolution.depth, 3);
         assert_eq!(resolution.tod, dir.path().join("Engine/Binaries/Win64"));
@@ -266,7 +256,7 @@ mod tests {
         touch(&dir.path().join("A/steam_api64.dll"));
         touch(&dir.path().join("B/steam_api64.dll"));
 
-        let resolution = resolve_target(dir.path(), false).unwrap();
+        let resolution = resolve_target(dir.path(), None).unwrap();
 
         assert_eq!(resolution.tod, dir.path().join("A"));
     }
@@ -278,7 +268,7 @@ mod tests {
         touch(&depth6.join("steam_api64.dll"));
         touch(&depth6.join("L7/steam_api64.dll")); // depth 7, must be unreachable
 
-        let resolution = resolve_target(dir.path(), false).unwrap();
+        let resolution = resolve_target(dir.path(), None).unwrap();
 
         assert_eq!(resolution.depth, 6);
         assert_eq!(resolution.tod, depth6);
@@ -300,7 +290,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         touch(&dir.path().join("steam_api64_orig.dll"));
 
-        let result = resolve_target(dir.path(), false);
+        let result = resolve_target(dir.path(), None);
 
         assert!(matches!(result, Err(AutoGseError::DllNotFound(_))));
     }
@@ -310,7 +300,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         touch(&dir.path().join("SomeGame.exe"));
 
-        let result = resolve_target(dir.path(), false);
+        let result = resolve_target(dir.path(), None);
 
         assert!(matches!(result, Err(AutoGseError::DllNotFound(_))));
     }
@@ -320,7 +310,7 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let missing = dir.path().join("does_not_exist");
 
-        let result = resolve_target(&missing, false);
+        let result = resolve_target(&missing, None);
 
         assert!(matches!(result, Err(AutoGseError::TargetNotFound(_))));
     }
@@ -364,7 +354,7 @@ mod tests {
         assert!(status.success(), "mklink /J should succeed without elevation");
 
         let start = std::time::Instant::now();
-        let result = resolve_target(dir.path(), false);
+        let result = resolve_target(dir.path(), None);
         assert!(start.elapsed() < std::time::Duration::from_secs(5), "BFS must terminate promptly despite a cyclic junction");
         assert!(matches!(result, Err(AutoGseError::DllNotFound(_))));
     }

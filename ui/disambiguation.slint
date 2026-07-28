@@ -1,0 +1,148 @@
+import { LineEdit, ScrollView } from "std-widgets.slint";
+import { Palette, Typography, Spacing } from "theme.slint";
+import { AGButton, AGButtonVariant, AGCard, AGElevation, AGTag, AGTagVariant } from "components.slint";
+
+export struct CandidateRow {
+    appid: string,
+    name: string,
+    score: string,
+}
+
+// Phase 7 §7.8.4: visual restyle of the working §7.6 dialog onto the
+// Modernist system — the selection/manual-entry/cancel logic below is
+// unchanged from before this restyle, only the presentation is new.
+// Capsule art and a real "Store ↗" link are §7.6's own already-recorded
+// open item (a second Steam Store API call per candidate, not built) — the
+// mockup's capsule box renders as an inert placeholder and the store link
+// as a disabled button, not fake interactivity.
+export component DisambiguationDialog inherits Window {
+    title: "AutoGSE - Steam App ID Disambiguation";
+    preferred-width: 640px;
+    preferred-height: 560px;
+    background: Palette.bg;
+
+    in property <string> target_dir: "";
+    in property <[CandidateRow]> candidates: [];
+    in-out property <string> manual_appid: "";
+
+    callback candidate_selected(string);
+    callback manual_selected(string);
+    callback cancelled();
+
+    VerticalLayout {
+        padding: Spacing.space-3;
+        spacing: Spacing.space-2;
+
+        Text {
+            text: "Disambiguate Game Title";
+            font-weight: Typography.heading-weight;
+            font-size: Typography.h4;
+            color: Palette.text;
+        }
+        Text {
+            text: "Folder: " + target_dir;
+            font-size: Typography.meta;
+            color: Palette.neutral-700;
+            wrap: word-wrap;
+        }
+
+        ScrollView {
+            VerticalLayout {
+                spacing: Spacing.space-2;
+                for row in candidates: AGCard {
+                    elevation: AGElevation.sm;
+
+                    ta := TouchArea {
+                        clicked => { candidate_selected(row.appid); }
+                    }
+                    HorizontalLayout {
+                        padding: Spacing.space-2;
+                        spacing: Spacing.space-3;
+
+                        Rectangle {
+                            width: 60px;
+                            height: 80px;
+                            border-width: 2px;
+                            border-color: Palette.neutral-500;
+                            background: ta.has-hover ? Palette.neutral-200 : Palette.neutral-100;
+                            Text {
+                                text: "Capsule";
+                                font-size: Typography.meta;
+                                color: Palette.neutral-600;
+                                wrap: word-wrap;
+                                horizontal-alignment: center;
+                            }
+                        }
+                        VerticalLayout {
+                            vertical-stretch: 1;
+                            alignment: center;
+                            spacing: Spacing.space-1;
+                            Text {
+                                text: row.name;
+                                font-weight: Typography.heading-weight;
+                                font-size: Typography.label;
+                                color: Palette.text;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: "App ID " + row.appid;
+                                font-size: Typography.meta;
+                                color: Palette.neutral-700;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            AGTag {
+                                text: row.score + " Match";
+                                variant: AGTagVariant.accent;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            AGButton {
+                                text: "Store ↗";
+                                variant: AGButtonVariant.ghost;
+                                enabled: false;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: "Or enter numeric Steam App ID manually";
+            font-size: Typography.meta;
+            color: Palette.text;
+        }
+        HorizontalLayout {
+            spacing: Spacing.space-2;
+            height: 36px;
+            Rectangle {
+                horizontal-stretch: 1;
+                background: white;
+                border-width: 2px;
+                border-color: Palette.text;
+                HorizontalLayout {
+                    padding-left: Spacing.space-2;
+                    manual_input := LineEdit {
+                        placeholder-text: "e.g. 1091500";
+                        text <=> manual_appid;
+                    }
+                }
+            }
+            AGButton {
+                text: "Use Manual App ID";
+                clicked => { manual_selected(manual_input.text); }
+            }
+        }
+
+        HorizontalLayout {
+            alignment: end;
+            AGButton {
+                text: "Cancel";
+                clicked => { cancelled(); }
+            }
+        }
+    }
+}

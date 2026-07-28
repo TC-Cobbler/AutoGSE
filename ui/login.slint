@@ -1,0 +1,116 @@
+import { LineEdit } from "std-widgets.slint";
+import { Palette, Typography, Spacing } from "theme.slint";
+import { AGButton, AGButtonVariant, AGCard, AGElevation, AGField } from "components.slint";
+
+// Phase 7 §7.8.3: new GUI surface over Steam login (`credentials::save`/
+// `delete`, previously CLI-only via `autogse login`/`logout`).
+//
+// **Correction found while building this, not in the original mockup
+// framing**: the mockup shows this as the mid-inject disclosure prompt (3
+// choices — log in / anon once / anon forever — plus a Steam Guard code
+// field), but there's no inject-from-GUI to disclose *during* yet (§7.0's
+// still-open blocker). The honest real action for a standalone dashboard
+// button is the CLI's plain `login`/`logout` — this dialog is a masked
+// credential form + Log In Now/Log Out, dropping the "continue anonymously"
+// choices entirely (they only mean something mid-inject). The Steam Guard
+// field is shown (matches the mockup) but disabled: a real Steam Guard
+// prompt happens later, inside `goldberg::run_with_timeout`'s console relay
+// during an actual `generate_emu_config.exe -tok` run — not at credential-
+// save time — so a live field here would silently do nothing.
+export component LoginDialog inherits Window {
+    title: "AutoGSE - Steam Login";
+    preferred-width: 480px;
+    preferred-height: 460px;
+    background: Palette.bg;
+
+    in property <bool> logged_in: false;
+    in property <string> logged_in_username: "";
+    in property <string> status_message: "";
+
+    callback login_requested(string /* username */, string /* password */);
+    callback logout_requested();
+
+    VerticalLayout {
+        padding: Spacing.space-3;
+        spacing: Spacing.space-2;
+
+        Text {
+            text: "AutoGSE — Steam Login";
+            font-weight: Typography.heading-weight;
+            font-size: Typography.h4;
+            color: Palette.text;
+        }
+
+        AGCard {
+            elevation: AGElevation.none;
+            background: Palette.surface;
+            VerticalLayout {
+                padding: Spacing.space-2;
+                spacing: Spacing.space-1;
+                Text {
+                    text: "Works anonymously: app name, DLCs, depots, branches, configs.";
+                    font-size: Typography.meta;
+                    color: Palette.text;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Requires Steam login: achievement titles, descriptions, icon images.";
+                    font-size: Typography.meta;
+                    color: Palette.text;
+                    wrap: word-wrap;
+                }
+                Text {
+                    text: "Encrypted locally via Windows DPAPI. Never sent anywhere except Steam itself.";
+                    font-size: Typography.meta;
+                    color: Palette.neutral-700;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        if !logged_in: VerticalLayout {
+            spacing: Spacing.space-2;
+            AGField {
+                label: "Steam username";
+                username_input := LineEdit { }
+            }
+            AGField {
+                label: "Steam password";
+                password_input := LineEdit { input-type: password; }
+            }
+            AGField {
+                label: "Steam Guard code (not yet wired — see dialog note)";
+                LineEdit {
+                    placeholder-text: "Requested later, during an actual injection run";
+                    enabled: false;
+                }
+            }
+            AGButton {
+                text: "Log In Now";
+                variant: AGButtonVariant.primary;
+                block: true;
+                clicked => { login_requested(username_input.text, password_input.text); }
+            }
+        }
+
+        if logged_in: VerticalLayout {
+            spacing: Spacing.space-2;
+            Text {
+                text: "Logged in as " + logged_in_username + ". Future injections will include achievement data automatically.";
+                color: Palette.text;
+                wrap: word-wrap;
+            }
+            AGButton {
+                text: "Log Out";
+                clicked => { logout_requested(); }
+            }
+        }
+
+        Text {
+            text: status_message;
+            color: Palette.text;
+            wrap: word-wrap;
+            font-size: Typography.meta;
+        }
+    }
+}

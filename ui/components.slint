@@ -1,0 +1,218 @@
+import { Palette, Typography, Spacing } from "theme.slint";
+
+// Phase 7 §7.8.0: shared component library matching the exact class
+// inventory `Mockups/modernist-design-tokens.md` documents (`.btn`, `.tag`,
+// `.card`, `.field`, `.seg`, `.hr`) — every `ui/*.slint` screen should import
+// from here instead of re-implementing button/tag/card styling inline, the
+// convention every pre-§7.8 file used independently. Zero corner radius
+// everywhere (`--radius-sm/md/lg: 0px` is deliberate per the token doc, not
+// a placeholder) — none of these components ever set `border-radius` except
+// the circular per-user-avatar-style cases that have no equivalent here.
+
+export enum AGButtonVariant { primary, secondary, ghost }
+
+// Text button. `.btn-icon` (icon-only, square) is a separate component
+// below (`AGIconButton`) rather than a variant here, since its layout
+// (centered glyph, no text) is different enough to not share this one's
+// text-flow logic.
+export component AGButton inherits Rectangle {
+    in property <string> text: "";
+    in property <AGButtonVariant> variant: AGButtonVariant.secondary;
+    in property <bool> enabled: true;
+    in property <bool> block: false;
+    callback clicked();
+
+    height: 36px;
+    // `block` (full-width) relies on the parent layout's stretch algorithm
+    // rather than a literal `100%` binding — Slint's ternary requires both
+    // arms to share one type, and `length`/`percent` don't mix in one
+    // expression, so `width` always supplies the same content-driven
+    // preferred size and `horizontal-stretch` is what actually grows it to
+    // fill a `block` button's parent `HorizontalLayout`/`VerticalLayout`.
+    width: label.preferred-width + 28px;
+    horizontal-stretch: block ? 1 : 0;
+    background: variant == AGButtonVariant.primary
+        ? (ta.pressed ? Palette.accent-700 : Palette.accent)
+        : (variant == AGButtonVariant.ghost ? transparent : (ta.has-hover ? Palette.neutral-200 : Palette.surface));
+    border-width: variant == AGButtonVariant.ghost ? 0px : 2px;
+    border-color: Palette.text;
+    opacity: enabled ? 1.0 : 0.5;
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    label := Text {
+        x: 14px;
+        y: 0;
+        height: 100%;
+        text: root.text;
+        font-size: Typography.label;
+        font-weight: Typography.heading-weight;
+        color: variant == AGButtonVariant.primary ? white : (variant == AGButtonVariant.ghost ? Palette.accent-700 : Palette.text);
+        vertical-alignment: center;
+        horizontal-alignment: left;
+    }
+}
+
+// Square icon-only button (`.btn-icon`) — place a single icon component
+// (see `icons.slint`) as this component's child, e.g. `AGIconButton {
+// IconGear {} }`.
+export component AGIconButton inherits Rectangle {
+    in property <bool> enabled: true;
+    callback clicked();
+
+    width: 36px;
+    height: 36px;
+    background: ta.has-hover ? Palette.neutral-200 : Palette.surface;
+    border-width: 2px;
+    border-color: Palette.text;
+    opacity: enabled ? 1.0 : 0.5;
+
+    ta := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.clicked(); }
+    }
+    VerticalLayout {
+        alignment: center;
+        HorizontalLayout {
+            alignment: center;
+            @children
+        }
+    }
+}
+
+export enum AGTagVariant { accent, accent2, neutral, outline }
+
+export component AGTag inherits Rectangle {
+    in property <string> text: "";
+    in property <AGTagVariant> variant: AGTagVariant.neutral;
+
+    height: 22px;
+    width: label.preferred-width + 16px;
+    background: variant == AGTagVariant.accent ? Palette.accent-100
+        : (variant == AGTagVariant.accent2 ? Palette.accent2-100
+        : (variant == AGTagVariant.neutral ? Palette.neutral-200 : transparent));
+    border-width: variant == AGTagVariant.outline ? 2px : 0px;
+    border-color: Palette.text;
+
+    label := Text {
+        x: 8px;
+        y: 0;
+        height: 100%;
+        text: root.text;
+        font-size: Typography.meta;
+        font-weight: Typography.heading-weight;
+        color: variant == AGTagVariant.accent ? Palette.accent-700
+            : (variant == AGTagVariant.accent2 ? Palette.accent2-700 : Palette.text);
+        vertical-alignment: center;
+    }
+}
+
+export enum AGElevation { none, sm, md, lg }
+
+// Content card (`.card` + `.elev-sm/md/lg`) — place arbitrary content as
+// children, laid out vertically with the token doc's ink-tinted shadow
+// (never plain black) at the requested elevation.
+export component AGCard inherits Rectangle {
+    in property <AGElevation> elevation: AGElevation.sm;
+
+    background: Palette.surface;
+    drop-shadow-color: elevation == AGElevation.lg ? #2d2b2b38 : (elevation == AGElevation.md ? #2d2b2b29 : #2d2b2b24);
+    drop-shadow-blur: elevation == AGElevation.lg ? 32px : (elevation == AGElevation.md ? 10px : (elevation == AGElevation.sm ? 2px : 0px));
+    drop-shadow-offset-y: elevation == AGElevation.lg ? 12px : (elevation == AGElevation.md ? 3px : (elevation == AGElevation.sm ? 1px : 0px));
+
+    VerticalLayout {
+        @children
+    }
+}
+
+// Segmented control (`.seg`/`.seg-opt`) — single-select row of text options.
+export struct AGSegOption {
+    text: string,
+}
+
+export component AGSeg inherits Rectangle {
+    in property <[AGSegOption]> options: [];
+    in-out property <int> selected-index: 0;
+    callback selected(int);
+
+    height: 36px;
+    width: row.preferred-width;
+    border-width: 2px;
+    border-color: Palette.text;
+
+    row := HorizontalLayout {
+        for opt[i] in options: Rectangle {
+            width: optlabel.preferred-width + 24px;
+            background: i == root.selected-index ? Palette.accent : (optta.has-hover ? Palette.neutral-200 : transparent);
+            border-width: i == 0 ? 0px : 2px;
+            border-color: Palette.text;
+
+            optta := TouchArea {
+                clicked => {
+                    root.selected-index = i;
+                    root.selected(i);
+                }
+            }
+            optlabel := Text {
+                text: opt.text;
+                font-weight: Typography.heading-weight;
+                font-size: Typography.label;
+                color: i == root.selected-index ? white : Palette.text;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+        }
+    }
+}
+
+// Labeled form field (`.field` + `label` + `.input`) — place the actual
+// input widget (`LineEdit`, `ComboBox`, ...) as this component's child.
+export component AGField inherits VerticalLayout {
+    in property <string> label: "";
+    spacing: Spacing.space-1;
+
+    Text {
+        text: root.label;
+        font-size: Typography.meta;
+        color: Palette.text;
+    }
+    @children
+}
+
+// Strong 2px rule (`.hr`).
+export component AGHr inherits Rectangle {
+    height: 2px;
+    background: Palette.divider;
+}
+
+// Minimal table header/row pair (`.table`) — sufficient for a simple
+// name+status list (Doctor's bundled-tool list); not a generic data grid.
+export component AGTableHeaderRow inherits Rectangle {
+    height: 32px;
+    border-width: 0px;
+    VerticalLayout {
+        alignment: end;
+        HorizontalLayout {
+            padding: Spacing.space-2;
+            @children
+        }
+        AGHr { }
+    }
+}
+
+export component AGTableRow inherits Rectangle {
+    height: 40px;
+    HorizontalLayout {
+        padding: Spacing.space-2;
+        @children
+    }
+    VerticalLayout {
+        alignment: end;
+        Rectangle {
+            height: 1px;
+            background: Palette.divider;
+        }
+    }
+}

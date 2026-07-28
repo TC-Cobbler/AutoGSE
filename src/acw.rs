@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::AutoGseError;
 use crate::goldberg::run_with_timeout;
+use crate::saves;
 
 const DEPLOY_TIMEOUT: Duration = Duration::from_secs(20);
 
@@ -56,29 +57,6 @@ fn deploy_schema_into(out_dir: &Path, aw_dir: &Path) -> Result<bool, AutoGseErro
     Ok(true)
 }
 
-/// Minimal INI reader: pulls one `[section]`'s `key=value` out of
-/// `configs.user.ini`. A real INI parser is overkill for the two keys this
-/// module needs.
-fn read_ini_value(content: &str, section: &str, key: &str) -> Option<String> {
-    let mut in_section = false;
-    for line in content.lines() {
-        let trimmed = line.trim();
-        if trimmed.starts_with('[') && trimmed.ends_with(']') {
-            in_section = trimmed[1..trimmed.len() - 1].eq_ignore_ascii_case(section);
-            continue;
-        }
-        if !in_section || trimmed.starts_with('#') || trimmed.starts_with(';') {
-            continue;
-        }
-        if let Some((k, v)) = trimmed.split_once('=') {
-            if k.trim().eq_ignore_ascii_case(key) {
-                return Some(v.trim().to_string());
-            }
-        }
-    }
-    None
-}
-
 /// Registers the game's save-data path(s) in Achievement Watcher's
 /// `userdir.db` — confirmed by direct inspection of a real installed copy
 /// to be a plain JSON array of `{path, notify}` objects, so this is a
@@ -105,19 +83,13 @@ fn register_save_paths_into(tod: &Path, configs_user_ini: &Path, aw_dir: &Path, 
     if !aw_dir.is_dir() {
         return Ok(false);
     }
-    let Ok(content) = std::fs::read_to_string(configs_user_ini) else {
+    if !configs_user_ini.is_file() {
         return Ok(false);
-    };
+    }
 
-    let saves_folder_name = read_ini_value(&content, "user::saves", "saves_folder_name").unwrap_or_else(|| "GSE Saves".to_string());
-    let local_save_path_raw = read_ini_value(&content, "user::saves", "local_save_path").unwrap_or_default();
-    let local_save_path = local_save_path_raw.trim().trim_start_matches("./").trim_start_matches(".\\");
-
-    let candidate_paths: Vec<PathBuf> = if !local_save_path.is_empty() {
-        vec![tod.join(&saves_folder_name), tod.join(local_save_path)]
-    } else {
-        vec![appdata_dir.join(&saves_folder_name)]
-    };
+    // Phase 8 §8.1 consolidated this resolution rule (previously duplicated
+    // here and in `achievements.rs`) into `saves::candidate_save_roots`.
+    let candidate_paths = saves::candidate_save_roots(tod, configs_user_ini, appdata_dir);
 
     let cfg_dir = aw_dir.join("cfg");
     std::fs::create_dir_all(&cfg_dir)?;
@@ -147,25 +119,6 @@ fn register_save_paths_into(tod: &Path, configs_user_ini: &Path, aw_dir: &Path, 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn read_ini_value_finds_key_in_section() {
-        let content = "[user::saves]\nlocal_save_path=\nsaves_folder_name=GSE Saves\n";
-        assert_eq!(read_ini_value(content, "user::saves", "saves_folder_name"), Some("GSE Saves".to_string()));
-        assert_eq!(read_ini_value(content, "user::saves", "local_save_path"), Some("".to_string()));
-    }
-
-    #[test]
-    fn read_ini_value_ignores_other_sections_and_comments() {
-        let content = "[user::general]\nsaves_folder_name=WRONG\n[user::saves]\n# comment\nsaves_folder_name=Right Value\n";
-        assert_eq!(read_ini_value(content, "user::saves", "saves_folder_name"), Some("Right Value".to_string()));
-    }
-
-    #[test]
-    fn read_ini_value_missing_key_is_none() {
-        let content = "[user::saves]\nsaves_folder_name=GSE Saves\n";
-        assert_eq!(read_ini_value(content, "user::saves", "nonexistent_key"), None);
-    }
 
     #[test]
     fn deploy_schema_is_noop_when_archive_missing() {

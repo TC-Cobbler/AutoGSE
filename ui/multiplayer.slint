@@ -1,0 +1,223 @@
+import { LineEdit, ScrollView } from "std-widgets.slint";
+import { Palette, Typography, Spacing } from "theme.slint";
+import { AGButton, AGButtonVariant, AGField, AGHr, AGIconButton } from "components.slint";
+import { IconRefresh } from "icons.slint";
+
+export struct TailscalePeerRow {
+    label: string,
+    ip: string,
+}
+
+// Phase 7 §7.8.8 built "Launch lobby_connect" (`engine::run_join`/
+// `goldberg::run_lobby_connect`, §6.7) — the dashboard's per-card Join Lobby
+// icon (§7.8.1) also calls it; this dialog is a second entry point for the
+// same action, for a game not currently in the scanned grid.
+//
+// Phase 9 §9.1/§9.2 builds everything below: the real `custom_broadcasts.txt`
+// peer list and `listen_port` (`src/lan.rs`), plus VPN adapter/Tailscale peer
+// detection (`src/vpn_adapters.rs`). There is no "room code"/"direct connect"
+// concept in real GSE (confirmed against the vendored README) — joining a
+// peer outside the local broadcast domain means adding their IP here, which
+// is why the previous placeholder's separate "Direct connect IP" field is
+// gone rather than wired up as its own thing.
+export component MultiplayerDialog inherits Window {
+    title: "AutoGSE - Multiplayer & Virtual LAN";
+    preferred-width: 640px;
+    preferred-height: 760px;
+    background: Palette.bg;
+
+    in-out property <string> target_path: "";
+    in property <string> status_message: "";
+    in property <bool> launching: false;
+
+    callback launch_requested(string);
+
+    in property <[string]> broadcast_peers: [];
+    in-out property <string> new_peer_text: "";
+    callback add_peer_requested(string);
+    callback remove_peer_requested(string);
+
+    in-out property <string> listen_port_text: "";
+    callback set_listen_port_requested(string);
+
+    callback refresh_requested(string);
+
+    in property <bool> detecting_vpn: false;
+    in property <[string]> vpn_adapters: [];
+    in property <[TailscalePeerRow]> tailscale_peers: [];
+    callback detect_vpn_requested();
+
+    ScrollView {
+        VerticalLayout {
+            padding: Spacing.space-3;
+            spacing: Spacing.space-2;
+
+            Text {
+                text: "Multiplayer Setup";
+                font-weight: Typography.heading-weight;
+                font-size: Typography.h4;
+                color: Palette.text;
+            }
+
+            AGField {
+                label: "Game folder or executable";
+                path_input := LineEdit {
+                    placeholder-text: "D:\\Games\\EldenRing";
+                    text <=> target_path;
+                }
+            }
+            AGButton {
+                text: launching ? "Launching..." : "Launch lobby_connect";
+                variant: AGButtonVariant.primary;
+                block: true;
+                enabled: !launching;
+                clicked => { launch_requested(path_input.text); }
+            }
+
+            Text {
+                text: status_message;
+                color: Palette.text;
+                wrap: word-wrap;
+                font-size: Typography.meta;
+            }
+
+            AGHr { }
+
+            HorizontalLayout {
+                Text {
+                    horizontal-stretch: 1;
+                    text: "Custom broadcast peers";
+                    font-weight: Typography.heading-weight;
+                    font-size: Typography.label;
+                    color: Palette.text;
+                    vertical-alignment: center;
+                }
+                AGIconButton {
+                    clicked => { refresh_requested(path_input.text); }
+                    IconRefresh { }
+                }
+            }
+            Text {
+                text: "Add a peer outside your local network (e.g. across a router or VPN) so the emulator sends broadcast traffic there directly. This target must already be injected — click refresh above after entering its path.";
+                font-size: Typography.meta;
+                color: Palette.neutral-700;
+                wrap: word-wrap;
+            }
+            for peer in broadcast_peers: HorizontalLayout {
+                spacing: Spacing.space-2;
+                height: 32px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: peer;
+                    color: Palette.text;
+                    vertical-alignment: center;
+                }
+                AGButton {
+                    text: "Remove";
+                    clicked => { remove_peer_requested(peer); }
+                }
+            }
+            HorizontalLayout {
+                spacing: Spacing.space-2;
+                height: 36px;
+                Rectangle {
+                    horizontal-stretch: 1;
+                    background: white;
+                    border-width: 2px;
+                    border-color: Palette.text;
+                    HorizontalLayout {
+                        padding-left: Spacing.space-2;
+                        peer_input := LineEdit {
+                            placeholder-text: "10.0.0.4 or friend.duckdns.org";
+                            text <=> new_peer_text;
+                        }
+                    }
+                }
+                AGButton {
+                    text: "Add Peer";
+                    variant: AGButtonVariant.primary;
+                    clicked => { add_peer_requested(peer_input.text); }
+                }
+            }
+
+            AGHr { }
+
+            HorizontalLayout {
+                spacing: Spacing.space-3;
+                AGField {
+                    label: "Listen port (every peer must agree on the same one — default 47584)";
+                    HorizontalLayout {
+                        spacing: Spacing.space-2;
+                        Rectangle {
+                            horizontal-stretch: 1;
+                            background: white;
+                            border-width: 2px;
+                            border-color: Palette.text;
+                            height: 36px;
+                            HorizontalLayout {
+                                padding-left: Spacing.space-2;
+                                port_input := LineEdit {
+                                    text <=> listen_port_text;
+                                }
+                            }
+                        }
+                        AGButton {
+                            text: "Apply";
+                            clicked => { set_listen_port_requested(port_input.text); }
+                        }
+                    }
+                }
+            }
+
+            AGHr { }
+
+            HorizontalLayout {
+                Text {
+                    horizontal-stretch: 1;
+                    text: "VPN adapters";
+                    font-weight: Typography.heading-weight;
+                    font-size: Typography.label;
+                    color: Palette.text;
+                    vertical-alignment: center;
+                }
+                AGIconButton {
+                    enabled: !detecting_vpn;
+                    clicked => { detect_vpn_requested(); }
+                    IconRefresh { }
+                }
+            }
+            Text {
+                text: detecting_vpn ? "Detecting..." : (vpn_adapters.length == 0 ? "No Tailscale/ZeroTier/Radmin VPN adapter detected on this machine." : "");
+                font-size: Typography.meta;
+                color: Palette.neutral-700;
+                wrap: word-wrap;
+            }
+            for adapter in vpn_adapters: Text {
+                text: adapter;
+                color: Palette.text;
+                font-size: Typography.meta;
+            }
+
+            Text {
+                text: "Tailscale peers (only Tailscale exposes a local API for this — ZeroTier/Radmin VPN need the peer's IP pasted in manually from their own app):";
+                font-size: Typography.meta;
+                color: Palette.neutral-700;
+                wrap: word-wrap;
+            }
+            for peer in tailscale_peers: HorizontalLayout {
+                spacing: Spacing.space-2;
+                height: 32px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: peer.label;
+                    color: Palette.text;
+                    vertical-alignment: center;
+                }
+                AGButton {
+                    text: "Add to broadcasts";
+                    clicked => { add_peer_requested(peer.ip); }
+                }
+            }
+        }
+    }
+}

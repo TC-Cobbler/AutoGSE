@@ -124,22 +124,37 @@ pub fn restore_backup(original: &Path, entry: &BackedUpFile, target_dir: &Path) 
 /// it, per PRD §8's "Existing Goldberg Config Present" edge case. Returns
 /// `None` (no-op) if `dir` doesn't exist. This is a one-way safety net, not
 /// auto-restored by revert — see `main.rs`'s revert flow.
+fn next_available_backup_path(original: &Path) -> PathBuf {
+    let name = original.file_name().unwrap_or_default().to_string_lossy().into_owned();
+    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+
+    let mut backup_path = original.with_file_name(format!("{name}.bak_{timestamp}"));
+    let mut suffix = 1u32;
+    while backup_path.exists() {
+        backup_path = original.with_file_name(format!("{name}.bak_{timestamp}_{suffix}"));
+        suffix += 1;
+    }
+    backup_path
+}
+
 pub fn backup_existing_dir(dir: &Path) -> Result<Option<PathBuf>, AutoGseError> {
     if !dir.is_dir() {
         return Ok(None);
     }
-
-    let name = dir.file_name().unwrap_or_default().to_string_lossy().into_owned();
-    let timestamp = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
-
-    let mut backup_path = dir.with_file_name(format!("{name}.bak_{timestamp}"));
-    let mut suffix = 1u32;
-    while backup_path.exists() {
-        backup_path = dir.with_file_name(format!("{name}.bak_{timestamp}_{suffix}"));
-        suffix += 1;
-    }
-
+    let backup_path = next_available_backup_path(dir);
     std::fs::rename(dir, &backup_path)?;
+    Ok(Some(backup_path))
+}
+
+/// Same one-way rename-aside safety net as [`backup_existing_dir`],
+/// generalized to a single file too — Phase 8 §8.2's save migration can
+/// target either a whole save folder or one specific save file.
+pub fn backup_existing_path(path: &Path) -> Result<Option<PathBuf>, AutoGseError> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let backup_path = next_available_backup_path(path);
+    std::fs::rename(path, &backup_path)?;
     Ok(Some(backup_path))
 }
 

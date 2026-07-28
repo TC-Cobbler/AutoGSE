@@ -6,6 +6,7 @@ use windows::Win32::System::Console::{
 
 use crate::credentials::Credentials;
 use crate::error::AutoGseError;
+use crate::retroachievements::RaCredentials;
 
 const RULE: &str = "===================================================================";
 
@@ -136,6 +137,43 @@ pub fn capture_login_stdio() -> Result<Credentials, AutoGseError> {
     }
 
     Ok(Credentials { username, password })
+}
+
+/// Phase 7 §7.7's `ra-login` subcommand: same masked-input pattern as
+/// `capture_login_stdio` (the API key is a secret, treated like a password —
+/// masked, and deliberately not accepted via a `--api-key` flag for the same
+/// shell-history/Explorer-recent-commands reason Steam login has no
+/// `--password` flag). RetroAchievements API keys are found on the account's
+/// own Settings page (retroachievements.org).
+pub fn capture_ra_login_stdio() -> Result<RaCredentials, AutoGseError> {
+    let mut stdout = std::io::stdout();
+    let _ = writeln!(stdout, "{RULE}");
+    let _ = writeln!(stdout, " AutoGSE - RetroAchievements Login");
+    let _ = writeln!(stdout, "{RULE}");
+    let _ = writeln!(stdout, " Enter your RetroAchievements username and Web API key (found on");
+    let _ = writeln!(stdout, " your account's Settings page at retroachievements.org). They're");
+    let _ = writeln!(stdout, " encrypted with Windows DPAPI and stored only on this PC - never");
+    let _ = writeln!(stdout, " transmitted anywhere except to RetroAchievements itself.");
+    let _ = writeln!(stdout, "{RULE}");
+
+    let _ = write!(stdout, " RetroAchievements username: ");
+    let _ = stdout.flush();
+    let mut username = String::new();
+    std::io::stdin().read_line(&mut username)?;
+    let username = username.trim().to_string();
+    if username.is_empty() {
+        return Err(AutoGseError::RetroAchievements("no username entered".to_string()));
+    }
+
+    let _ = write!(stdout, " RetroAchievements API key: ");
+    let _ = stdout.flush();
+    let api_key = read_password_stdio()?;
+    let _ = writeln!(stdout);
+    if api_key.is_empty() {
+        return Err(AutoGseError::RetroAchievements("no API key entered".to_string()));
+    }
+
+    Ok(RaCredentials { username, api_key })
 }
 
 #[cfg(test)]

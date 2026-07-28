@@ -1,0 +1,353 @@
+import { LineEdit, CheckBox, ComboBox, ScrollView } from "std-widgets.slint";
+import { Palette, Typography, Spacing } from "theme.slint";
+import { AGButton, AGButtonVariant, AGSeg, AGSegOption, AGHr } from "components.slint";
+
+export struct IniEntryRow {
+    key: string,
+    value: string,
+}
+export struct IniSectionRow {
+    name: string,
+    entries: [IniEntryRow],
+}
+export struct ConfigFileRow {
+    label: string,
+    sections: [IniSectionRow],
+}
+
+export struct DlcRow {
+    app_id: string,
+    name: string,
+}
+
+export struct PersonaRow {
+    name: string,
+}
+
+export struct ModRow {
+    id: string,
+    title: string,
+}
+
+// Phase 7 §7.4/§7.8.5: a tabbed inspector/editor over an already-injected
+// target's `steam_settings/configs.*.ini` files. Tabs are driven by an
+// `AGSeg` segmented control (Modernist restyle of the original `TabWidget`)
+// rather than Slint's `TabWidget` chrome — each tab's content is a plain
+// `Rectangle` shown/hidden via `visible: current_tab == N`, since `AGSeg`
+// itself carries no content-switching behavior of its own.
+export component ConfigEditorDialog inherits Window {
+    title: "AutoGSE - Config Editor";
+    preferred-width: 820px;
+    preferred-height: 680px;
+    background: Palette.bg;
+
+    in property <string> target_path: "";
+    in property <[ConfigFileRow]> config_files: [];
+    in property <bool> unlock_all: false;
+    in property <[DlcRow]> dlc_entries: [];
+    in property <[string]> languages: [];
+    in property <string> current_language: "";
+    in property <[PersonaRow]> saved_personas: [];
+    in property <string> status_message: "";
+
+    // Phase 7 §7.8.5's new Networking tab.
+    in property <bool> net_offline: false;
+    in property <bool> net_steam_deck: false;
+    in property <bool> net_achievements_bypass: false;
+    in property <bool> net_disable_overlay_gameid: false;
+    in property <bool> net_preowned_ids: false;
+    in property <bool> net_new_app_ticket: false;
+
+    // Phase 7 §7.8.5's new Workshop Mods tab — read-only listing for now
+    // (see `mods::load_mods`'s own doc comment on why "Add Mod" isn't wired
+    // here yet: it needs a native file-open dialog not built this pass).
+    in property <[ModRow]> mods: [];
+
+    in-out property <string> new_dlc_id: "";
+    in-out property <string> new_dlc_name: "";
+    in-out property <string> new_persona_name: "";
+    in-out property <int> current_tab: 0;
+
+    callback set_unlock_all(bool);
+    callback toggle_dlc(string /* app_id */, string /* name */, bool /* unlocked */);
+    callback add_custom_dlc(string /* id */, string /* name */);
+    callback select_language(string);
+    callback apply_persona(string /* name */);
+    callback save_current_as_persona(string /* name */);
+    callback delete_persona(string /* name */);
+    callback set_offline(bool);
+    callback set_steam_deck(bool);
+    callback toggle_compat_flag(string /* flag */, bool /* enabled */);
+
+    VerticalLayout {
+        padding: Spacing.space-3;
+        spacing: Spacing.space-2;
+
+        Text {
+            text: target_path;
+            font-weight: Typography.heading-weight;
+            font-size: Typography.label;
+            color: Palette.text;
+            wrap: word-wrap;
+        }
+
+        AGSeg {
+            options: [
+                { text: "Persona" },
+                { text: "DLC Manager" },
+                { text: "Networking" },
+                { text: "Workshop Mods" },
+                { text: "Overview" },
+            ];
+            selected-index <=> current_tab;
+        }
+
+        Rectangle {
+            visible: current_tab == 0;
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: Spacing.space-3;
+                Text {
+                    text: "Language";
+                    font-weight: Typography.heading-weight;
+                    color: Palette.text;
+                }
+                ComboBox {
+                    model: languages;
+                    current-value: current_language;
+                    selected(value) => { select_language(value); }
+                }
+
+                Text {
+                    text: "Saved Personas";
+                    font-weight: Typography.heading-weight;
+                    color: Palette.text;
+                }
+                ScrollView {
+                    VerticalLayout {
+                        spacing: Spacing.space-1;
+                        for persona in saved_personas: HorizontalLayout {
+                            spacing: Spacing.space-1;
+                            Text {
+                                text: persona.name;
+                                color: Palette.text;
+                                vertical-alignment: center;
+                            }
+                            AGButton {
+                                text: "Apply";
+                                clicked => { apply_persona(persona.name); }
+                            }
+                            AGButton {
+                                text: "Delete";
+                                variant: AGButtonVariant.ghost;
+                                clicked => { delete_persona(persona.name); }
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Spacing.space-1;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: white;
+                        border-width: 2px;
+                        border-color: Palette.text;
+                        HorizontalLayout {
+                            padding-left: Spacing.space-2;
+                            persona_name_input := LineEdit {
+                                placeholder-text: "Save current as...";
+                                text <=> new_persona_name;
+                            }
+                        }
+                    }
+                    AGButton {
+                        text: "Save";
+                        clicked => {
+                            save_current_as_persona(persona_name_input.text);
+                            new_persona_name = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            visible: current_tab == 1;
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: Spacing.space-2;
+                CheckBox {
+                    text: "Report all DLCs as unlocked (unlock_all)";
+                    checked: unlock_all;
+                    toggled => { set_unlock_all(self.checked); }
+                }
+                ScrollView {
+                    VerticalLayout {
+                        spacing: Spacing.space-1;
+                        for dlc in dlc_entries: HorizontalLayout {
+                            spacing: Spacing.space-1;
+                            dlc_checkbox := CheckBox {
+                                checked: true;
+                                toggled => { toggle_dlc(dlc.app_id, dlc.name, dlc_checkbox.checked); }
+                            }
+                            Text {
+                                text: dlc.name + "  (" + dlc.app_id + ")";
+                                color: Palette.text;
+                                vertical-alignment: center;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+                HorizontalLayout {
+                    spacing: Spacing.space-1;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: white;
+                        border-width: 2px;
+                        border-color: Palette.text;
+                        HorizontalLayout {
+                            padding-left: Spacing.space-2;
+                            dlc_id_input := LineEdit { placeholder-text: "Custom DLC App ID..."; }
+                        }
+                    }
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: white;
+                        border-width: 2px;
+                        border-color: Palette.text;
+                        HorizontalLayout {
+                            padding-left: Spacing.space-2;
+                            dlc_name_input := LineEdit { placeholder-text: "Name..."; }
+                        }
+                    }
+                    AGButton {
+                        text: "Add";
+                        clicked => {
+                            add_custom_dlc(dlc_id_input.text, dlc_name_input.text);
+                            dlc_id_input.text = "";
+                            dlc_name_input.text = "";
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            visible: current_tab == 2;
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: Spacing.space-2;
+                HorizontalLayout {
+                    CheckBox {
+                        text: "Offline (fully local, no broadcast)";
+                        checked: net_offline;
+                        toggled => { set_offline(self.checked); }
+                    }
+                }
+                HorizontalLayout {
+                    CheckBox {
+                        text: "Pretend to run on a Steam Deck";
+                        checked: net_steam_deck;
+                        toggled => { set_steam_deck(self.checked); }
+                    }
+                }
+                AGHr { }
+                Text {
+                    text: "Compatibility workarounds";
+                    font-weight: Typography.heading-weight;
+                    color: Palette.text;
+                }
+                HorizontalLayout {
+                    CheckBox {
+                        text: "achievements_bypass";
+                        checked: net_achievements_bypass;
+                        toggled => { toggle_compat_flag("achievements_bypass", self.checked); }
+                    }
+                }
+                HorizontalLayout {
+                    CheckBox {
+                        text: "disable_steamoverlaygameid_env_var";
+                        checked: net_disable_overlay_gameid;
+                        toggled => { toggle_compat_flag("disable_steamoverlaygameid_env_var", self.checked); }
+                    }
+                }
+                HorizontalLayout {
+                    CheckBox {
+                        text: "enable_steam_preowned_ids";
+                        checked: net_preowned_ids;
+                        toggled => { toggle_compat_flag("enable_steam_preowned_ids", self.checked); }
+                    }
+                }
+                HorizontalLayout {
+                    CheckBox {
+                        text: "new_app_ticket";
+                        checked: net_new_app_ticket;
+                        toggled => { toggle_compat_flag("new_app_ticket", self.checked); }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            visible: current_tab == 3;
+            vertical-stretch: 1;
+            VerticalLayout {
+                spacing: Spacing.space-2;
+                Text {
+                    text: mods.length == 0 ? "No Workshop mods configured for this target yet." : "Configured Workshop mods (read-only — adding one needs a native file picker not built yet):";
+                    font-size: Typography.meta;
+                    color: Palette.neutral-700;
+                    wrap: word-wrap;
+                }
+                ScrollView {
+                    VerticalLayout {
+                        spacing: Spacing.space-1;
+                        for m in mods: Text {
+                            text: m.title + "  (" + m.id + ")";
+                            color: Palette.text;
+                        }
+                    }
+                }
+            }
+        }
+
+        Rectangle {
+            visible: current_tab == 4;
+            vertical-stretch: 1;
+            ScrollView {
+                VerticalLayout {
+                    spacing: Spacing.space-3;
+                    for file in config_files: VerticalLayout {
+                        spacing: Spacing.space-1;
+                        Text {
+                            text: file.label;
+                            font-weight: Typography.heading-weight;
+                            font-size: Typography.label;
+                            color: Palette.text;
+                        }
+                        for section in file.sections: VerticalLayout {
+                            Text {
+                                text: "[" + section.name + "]";
+                                color: Palette.neutral-700;
+                            }
+                            for entry in section.entries: Text {
+                                text: "    " + entry.key + " = " + entry.value;
+                                font-size: Typography.meta;
+                                color: Palette.text;
+                                wrap: word-wrap;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            text: status_message;
+            color: Palette.text;
+            wrap: word-wrap;
+            font-size: Typography.meta;
+        }
+    }
+}

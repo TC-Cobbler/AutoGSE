@@ -63,6 +63,24 @@ pub enum AutoGseError {
     #[error("could not find a game executable under {0} to point --mode steamclient's loader at")]
     NoGameExeFound(PathBuf),
 
+    #[error("could not fetch Steam header image: {0}")]
+    HeaderFetch(String),
+
+    #[error("could not watch achievement unlock-state file: {0}")]
+    UnlockWatchFailed(String),
+
+    #[error("RetroAchievements: {0}")]
+    RetroAchievements(String),
+
+    #[error("Ludusavi manifest: {0}")]
+    Ludusavi(String),
+
+    #[error("save sync: {0}")]
+    SaveSync(String),
+
+    #[error("LAN settings: {0}")]
+    Lan(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -96,6 +114,12 @@ impl AutoGseError {
             AutoGseError::InvalidOverlayPosition(_) => 24,
             AutoGseError::InvalidCompatFlag(_) => 25,
             AutoGseError::NoGameExeFound(_) => 26,
+            AutoGseError::HeaderFetch(_) => 27,
+            AutoGseError::UnlockWatchFailed(_) => 28,
+            AutoGseError::RetroAchievements(_) => 29,
+            AutoGseError::Ludusavi(_) => 30,
+            AutoGseError::SaveSync(_) => 31,
+            AutoGseError::Lan(_) => 32,
         }
     }
 }

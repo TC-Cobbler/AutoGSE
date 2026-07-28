@@ -36,7 +36,7 @@ fn credentials_path(dir: &Path) -> PathBuf {
 /// DPAPI over a hand-rolled AES scheme). `CRYPTPROTECT_UI_FORBIDDEN` makes a
 /// failure return an error instead of silently blocking on a Windows UI
 /// prompt we'd never see from a CLI.
-fn dpapi_protect(plaintext: &mut [u8]) -> Result<Vec<u8>, AutoGseError> {
+pub(crate) fn dpapi_protect(plaintext: &mut [u8]) -> Result<Vec<u8>, AutoGseError> {
     let input = CRYPT_INTEGER_BLOB { cbData: plaintext.len() as u32, pbData: plaintext.as_mut_ptr() };
     let mut output = CRYPT_INTEGER_BLOB::default();
 
@@ -52,7 +52,7 @@ fn dpapi_protect(plaintext: &mut [u8]) -> Result<Vec<u8>, AutoGseError> {
     Ok(encrypted)
 }
 
-fn dpapi_unprotect(ciphertext: &mut [u8]) -> Result<Vec<u8>, AutoGseError> {
+pub(crate) fn dpapi_unprotect(ciphertext: &mut [u8]) -> Result<Vec<u8>, AutoGseError> {
     let input = CRYPT_INTEGER_BLOB { cbData: ciphertext.len() as u32, pbData: ciphertext.as_mut_ptr() };
     let mut output = CRYPT_INTEGER_BLOB::default();
 

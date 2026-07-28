@@ -1,4 +1,6 @@
 fn main() {
+    slint_build::compile("ui/main.slint").expect("failed to compile Slint UI (ui/main.slint)");
+
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut res = winres::WindowsResource::new();
         res.set_manifest_file("assets/app.manifest");

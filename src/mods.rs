@@ -87,6 +87,29 @@ pub fn add_mod(tod: &Path, req: &AddModRequest) -> Result<Vec<String>, AutoGseEr
     Ok(written)
 }
 
+/// One entry's minimal view for Phase 7 §7.8.5's Workshop Mods tab — reads
+/// back what `add_mod` writes. Not the full private `ModEntry` schema:
+/// a GUI list only needs the id/title to display, same "narrower read
+/// model than the write schema" convention `achievements.rs`'s view struct
+/// already uses.
+pub struct ModListEntry {
+    pub id: String,
+    pub title: String,
+}
+
+/// Read-only for now — Phase 7 §7.8.5 scoped the Workshop Mods tab down to
+/// listing what's already configured; wiring a real "Add Mod" flow needs a
+/// native Win32 file-open dialog (Slint has no built-in file picker) that
+/// wasn't built in this pass, tracked separately rather than rushed.
+pub fn load_mods(tod: &Path) -> Result<Vec<ModListEntry>, AutoGseError> {
+    let path = tod.join("steam_settings").join("mods.json");
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let entries: BTreeMap<String, ModEntry> = serde_json::from_slice(&std::fs::read(&path)?)?;
+    Ok(entries.into_iter().map(|(id, e)| ModListEntry { id, title: e.title }).collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -190,5 +213,24 @@ mod tests {
         assert_eq!(parsed.len(), 2);
         assert_eq!(parsed["1"]["title"], "Other Mod");
         assert_eq!(parsed["2"]["title"], "New Mod");
+    }
+
+    #[test]
+    fn load_mods_is_empty_when_file_missing() {
+        let tod = tempfile::tempdir().unwrap();
+        assert!(load_mods(tod.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn load_mods_reads_real_written_shape() {
+        let tod = tempfile::tempdir().unwrap();
+        let src_dir = tempfile::tempdir().unwrap();
+        let primary = make_file(src_dir.path(), "metadata.json", b"mod data");
+        add_mod(tod.path(), &AddModRequest { id: 42, title: "A Mod".to_string(), description: None, primary_file: &primary, preview_file: None }).unwrap();
+
+        let mods = load_mods(tod.path()).unwrap();
+        assert_eq!(mods.len(), 1);
+        assert_eq!(mods[0].id, "42");
+        assert_eq!(mods[0].title, "A Mod");
     }
 }

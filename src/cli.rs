@@ -37,6 +37,17 @@ pub enum Command {
     /// Remove stored Steam login credentials (reverts to anonymous mode).
     Logout,
 
+    /// Store RetroAchievements.org login credentials (username + Web API
+    /// key) for the achievement viewer's RetroAchievements panel (§7.7). A
+    /// separate account/secret from Steam login above — not required for
+    /// Goldberg/Steam injection at all.
+    #[command(name = "ra-login")]
+    RaLogin,
+
+    /// Remove stored RetroAchievements.org login credentials.
+    #[command(name = "ra-logout")]
+    RaLogout,
+
     /// Manually generate controller action-set files from a hand-supplied
     /// Steam `.vdf` (e.g. downloaded from SteamDB/Workshop), for games
     /// where `--controller`'s automatic download doesn't cover what's
@@ -84,6 +95,93 @@ pub enum Command {
     /// prints a message.
     #[command(name = "check-update")]
     CheckUpdate,
+
+    /// Migrate save data between a game's real Steam-side save location and
+    /// its Goldberg one (`<save_root>\<AppID>`), backing up whatever's
+    /// currently at the destination first. The target must already be
+    /// injected (its App ID comes from `.gse_manifest.json`).
+    #[command(name = "sync-saves")]
+    SyncSaves(SyncSavesArgs),
+
+    /// Copies the real Steam controller glyph images from this machine's
+    /// Steam install into an already-injected target, replacing the free
+    /// example glyphs `generate_emu_config` deploys unconditionally.
+    #[command(hide = true, name = "deploy-real-glyphs")]
+    DeployRealGlyphs(DeployRealGlyphsArgs),
+
+    /// Snapshots an already-injected target's achievement/save progress
+    /// into a local timestamped backup, optionally also copying it to a
+    /// local folder (e.g. an already-installed OneDrive/Google Drive/Dropbox
+    /// sync folder — no cloud API integration, just an ordinary folder copy).
+    #[command(name = "backup-achievements")]
+    BackupAchievements(BackupAchievementsArgs),
+
+    /// List every local backup snapshot recorded on this machine.
+    #[command(name = "list-backups")]
+    ListBackups,
+
+    /// Restores one backup snapshot's achievement/save data onto a target.
+    Restore(RestoreArgs),
+
+    /// Manage this target's real network settings: its custom broadcast
+    /// peer list (`steam_settings/custom_broadcasts.txt`) and its
+    /// `listen_port` (`configs.main.ini`'s `[main::connectivity]` section).
+    /// There is no "room code" concept in real GSE — joining a peer outside
+    /// the local UDP broadcast domain (e.g. across a router or VPN) means
+    /// adding their IP/domain here so the emulator sends broadcast traffic
+    /// there directly; `join` (above) remains the actual lobby-discovery UI.
+    Lan(LanArgs),
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct BackupAchievementsArgs {
+    /// The already-injected game folder (must contain `.gse_manifest.json`).
+    #[arg(long)]
+    pub path: PathBuf,
+
+    /// Also copy the snapshot to this folder (any local folder, including
+    /// an already-installed cloud-sync folder).
+    #[arg(long)]
+    pub cloud: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct RestoreArgs {
+    /// The already-injected game folder to restore onto.
+    #[arg(long)]
+    pub path: PathBuf,
+
+    /// The snapshot ID to restore, as shown by `list-backups`.
+    #[arg(long)]
+    pub snapshot: String,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct DeployRealGlyphsArgs {
+    /// The already-injected game folder (must contain `.gse_manifest.json`).
+    #[arg(long)]
+    pub path: PathBuf,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct SyncSavesArgs {
+    /// The already-injected game folder (must contain `.gse_manifest.json`).
+    #[arg(long)]
+    pub path: PathBuf,
+
+    #[arg(long, value_enum)]
+    pub direction: SyncDirection,
+
+    /// Explicit Steam-side save folder/file, overriding the automatic
+    /// Ludusavi-manifest/common-directory resolution.
+    #[arg(long = "steam-path")]
+    pub steam_path: Option<PathBuf>,
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncDirection {
+    ToGoldberg,
+    ToSteam,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -91,6 +189,48 @@ pub struct JoinArgs {
     /// Path to the game executable or its containing folder.
     #[arg(long)]
     pub path: PathBuf,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct LanArgs {
+    /// The already-injected game folder (must contain `.gse_manifest.json`).
+    #[arg(long)]
+    pub path: PathBuf,
+
+    #[command(subcommand)]
+    pub action: LanAction,
+}
+
+#[derive(clap::Subcommand, Debug, Clone)]
+pub enum LanAction {
+    /// Add a peer's IP or domain to this target's custom broadcast list.
+    AddPeer { ip_or_domain: String },
+
+    /// Remove a peer's IP or domain from the custom broadcast list.
+    RemovePeer { ip_or_domain: String },
+
+    /// List every peer currently in the custom broadcast list.
+    ListPeers,
+
+    /// Set the UDP/TCP port the emulator listens on — every peer must agree
+    /// on the same port.
+    SetListenPort { port: u16 },
+
+    /// Apply a named network preset.
+    ApplyPreset {
+        #[arg(value_enum)]
+        preset: CliNetworkPreset,
+
+        /// Required when `preset` is `custom-port`.
+        #[arg(long)]
+        port: Option<u16>,
+    },
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CliNetworkPreset {
+    Default,
+    CustomPort,
 }
 
 #[derive(clap::Args, Debug, Clone)]

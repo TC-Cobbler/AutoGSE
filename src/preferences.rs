@@ -35,6 +35,28 @@ pub struct Preferences {
     /// leaves the emu's own generated default alone.
     #[serde(default)]
     pub overlay_prefs: OverlayPrefs,
+
+    /// Named, switchable personas (Phase 7 §7.4's "Account Profile
+    /// Switcher") — distinct from `default_account_name`/`default_language`
+    /// above, which remain the single implicit default applied when no CLI
+    /// flag/named persona is chosen. A schema addition confirmed with the
+    /// user before building, since it's new on-disk state alongside fields
+    /// other code already reads.
+    #[serde(default)]
+    pub saved_personas: Vec<NamedPersona>,
+}
+
+/// One saved profile a user can switch an already-injected target to via
+/// the GUI's config editor (Phase 7 §7.4) — `name` is the profile's own
+/// label, deliberately distinct from `account_name` (the in-game Steam
+/// persona name it sets).
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
+pub struct NamedPersona {
+    pub name: String,
+    #[serde(default)]
+    pub account_name: Option<String>,
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 /// Mirrors `configs.overlay.ini`'s `[overlay::appearance]` keys exactly
@@ -144,6 +166,32 @@ pub fn set_overlay_prefs(updates: OverlayPrefs) -> Result<(), AutoGseError> {
     save_in(&dir, &prefs)
 }
 
+/// Creates a new saved persona, or overwrites the existing one of the same
+/// `name` — re-saving under a name already in use is an update, not a
+/// duplicate entry.
+pub fn save_named_persona(name: String, account_name: Option<String>, language: Option<String>) -> Result<(), AutoGseError> {
+    let dir = credentials::store_dir()?;
+    let mut prefs = load_in(&dir)?;
+    match prefs.saved_personas.iter_mut().find(|p| p.name == name) {
+        Some(existing) => {
+            existing.account_name = account_name;
+            existing.language = language;
+        }
+        None => prefs.saved_personas.push(NamedPersona { name, account_name, language }),
+    }
+    save_in(&dir, &prefs)
+}
+
+/// Removing a persona that isn't saved is a no-op, not an error — mirrors
+/// `index::forget`'s convention for the same reason: a caller shouldn't need
+/// to check existence first just to express "make sure this is gone."
+pub fn delete_named_persona(name: &str) -> Result<(), AutoGseError> {
+    let dir = credentials::store_dir()?;
+    let mut prefs = load_in(&dir)?;
+    prefs.saved_personas.retain(|p| p.name != name);
+    save_in(&dir, &prefs)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -227,5 +275,67 @@ mod tests {
         let loaded = load_in(dir.path()).unwrap();
         assert_eq!(loaded.overlay_prefs.pos_achievement.as_deref(), Some("bot_right"));
         assert_eq!(loaded.overlay_prefs.duration_achievement, Some(12.0));
+    }
+
+    #[test]
+    fn loads_preferences_missing_saved_personas_field() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path()).unwrap();
+        std::fs::write(preferences_path(dir.path()), "{}").unwrap();
+        assert_eq!(load_in(dir.path()).unwrap().saved_personas, Vec::new());
+    }
+
+    #[test]
+    fn round_trips_saved_personas() {
+        let dir = tempfile::tempdir().unwrap();
+        let persona = NamedPersona { name: "Speedrun".to_string(), account_name: Some("speedy".to_string()), language: Some("english".to_string()) };
+        let prefs = Preferences { saved_personas: vec![persona.clone()], ..Default::default() };
+        save_in(dir.path(), &prefs).unwrap();
+        assert_eq!(load_in(dir.path()).unwrap().saved_personas, vec![persona]);
+    }
+
+    /// Exercises the same "update by name, else push" rule
+    /// `save_named_persona` applies, without needing to redirect its real
+    /// `credentials::store_dir()` call — same style as this file's existing
+    /// `set_default_persona_only_overwrites_supplied_fields` test.
+    #[test]
+    fn saved_personas_update_by_name_instead_of_duplicating() {
+        let dir = tempfile::tempdir().unwrap();
+        save_in(dir.path(), &Preferences {
+            saved_personas: vec![NamedPersona { name: "Speedrun".to_string(), account_name: Some("speedy".to_string()), language: None }],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut prefs = load_in(dir.path()).unwrap();
+        let existing = prefs.saved_personas.iter_mut().find(|p| p.name == "Speedrun").unwrap();
+        existing.language = Some("german".to_string());
+        save_in(dir.path(), &prefs).unwrap();
+
+        let loaded = load_in(dir.path()).unwrap();
+        assert_eq!(loaded.saved_personas.len(), 1);
+        assert_eq!(loaded.saved_personas[0].account_name.as_deref(), Some("speedy"));
+        assert_eq!(loaded.saved_personas[0].language.as_deref(), Some("german"));
+    }
+
+    #[test]
+    fn saved_personas_retain_removes_only_the_matching_entry() {
+        let dir = tempfile::tempdir().unwrap();
+        save_in(dir.path(), &Preferences {
+            saved_personas: vec![
+                NamedPersona { name: "A".to_string(), account_name: None, language: None },
+                NamedPersona { name: "B".to_string(), account_name: None, language: None },
+            ],
+            ..Default::default()
+        })
+        .unwrap();
+
+        let mut prefs = load_in(dir.path()).unwrap();
+        prefs.saved_personas.retain(|p| p.name != "A");
+        save_in(dir.path(), &prefs).unwrap();
+
+        let loaded = load_in(dir.path()).unwrap();
+        assert_eq!(loaded.saved_personas.len(), 1);
+        assert_eq!(loaded.saved_personas[0].name, "B");
     }
 }

@@ -1,0 +1,179 @@
+import { LineEdit, ScrollView } from "std-widgets.slint";
+import { Palette, Typography, Spacing } from "theme.slint";
+import { AGButton, AGButtonVariant, AGCard, AGElevation, AGSeg, AGSegOption } from "components.slint";
+
+export struct AchievementRow {
+    name: string,
+    display_name: string,
+    description: string,
+    hidden: bool,
+    unlocked: bool,
+    icon: image,
+}
+
+// Phase 7 §7.5/§7.8.7: read-only viewer over `steam_settings/achievements.json`
+// + its icon files, with real unlock status merged in (§7.5's confirmed
+// `<save_root>\<AppID>\achievements.json` reader). §7.7 adds a second data
+// source: fetching a RetroAchievements.org game's progress replaces the same
+// `achievements` list below rather than maintaining two separate lists —
+// whichever was most recently loaded is what's shown, with `status_message`
+// naming the source. §7.8.7 restyles this as a card grid with a real
+// progress bar and an All/Unlocked/Locked/Hidden filter (pure client-side —
+// no backend change). Rarity tags are deliberately not present: Phase 13's
+// rarity computation doesn't exist anywhere in this codebase yet.
+export component AchievementsDialog inherits Window {
+    title: "AutoGSE - Achievements";
+    preferred-width: 640px;
+    preferred-height: 700px;
+    background: Palette.bg;
+
+    in property <string> target_path: "";
+    in property <[AchievementRow]> achievements: [];
+    in property <string> status_message: "";
+    in property <float> unlock-ratio: 0.0;
+
+    in-out property <string> ra_game_id: "";
+    in property <string> ra_status_message: "";
+    in property <bool> ra_fetching: false;
+
+    in-out property <int> filter_index: 0;
+
+    callback ra_fetch_requested(string);
+
+    VerticalLayout {
+        padding: Spacing.space-3;
+        spacing: Spacing.space-2;
+
+        HorizontalLayout {
+            spacing: Spacing.space-3;
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: center;
+                spacing: Spacing.space-1;
+                Text {
+                    text: target_path;
+                    font-weight: Typography.heading-weight;
+                    font-size: Typography.h5;
+                    color: Palette.text;
+                    wrap: word-wrap;
+                }
+                Rectangle {
+                    height: 8px;
+                    background: Palette.neutral-200;
+                    Rectangle {
+                        x: 0;
+                        width: parent.width * unlock-ratio;
+                        height: 100%;
+                        background: Palette.accent;
+                    }
+                }
+                Text {
+                    text: status_message;
+                    font-size: Typography.meta;
+                    color: Palette.neutral-700;
+                    wrap: word-wrap;
+                }
+            }
+            AGSeg {
+                options: [
+                    { text: "All" },
+                    { text: "Unlocked" },
+                    { text: "Locked" },
+                    { text: "Hidden" },
+                ];
+                selected-index <=> filter_index;
+            }
+        }
+
+        AGCard {
+            elevation: AGElevation.none;
+            background: Palette.surface;
+            VerticalLayout {
+                padding: Spacing.space-2;
+                spacing: Spacing.space-1;
+                Text {
+                    text: "RetroAchievements.org — load a different data source into the list below, by RA Game ID. Requires `autogse ra-login` first.";
+                    wrap: word-wrap;
+                    font-size: Typography.meta;
+                    color: Palette.neutral-700;
+                }
+                HorizontalLayout {
+                    spacing: Spacing.space-1;
+                    Rectangle {
+                        horizontal-stretch: 1;
+                        background: white;
+                        border-width: 2px;
+                        border-color: Palette.text;
+                        HorizontalLayout {
+                            padding-left: Spacing.space-2;
+                            ra_game_id_input := LineEdit {
+                                placeholder-text: "RetroAchievements Game ID...";
+                                text <=> ra_game_id;
+                                input-type: number;
+                            }
+                        }
+                    }
+                    AGButton {
+                        text: ra_fetching ? "Loading..." : "Load RetroAchievements Progress";
+                        enabled: !ra_fetching;
+                        clicked => { ra_fetch_requested(ra_game_id_input.text); }
+                    }
+                }
+                Text {
+                    text: ra_status_message;
+                    font-size: Typography.meta;
+                    color: Palette.text;
+                    wrap: word-wrap;
+                }
+            }
+        }
+
+        ScrollView {
+            VerticalLayout {
+                alignment: start;
+                spacing: Spacing.space-2;
+
+                for row in achievements: AGCard {
+                    elevation: AGElevation.sm;
+                    visible: filter_index == 0
+                        || (filter_index == 1 && row.unlocked)
+                        || (filter_index == 2 && !row.unlocked)
+                        || (filter_index == 3 && row.hidden);
+
+                    HorizontalLayout {
+                        padding: Spacing.space-2;
+                        spacing: Spacing.space-2;
+                        Image {
+                            source: row.icon;
+                            width: 48px;
+                            height: 48px;
+                        }
+                        VerticalLayout {
+                            horizontal-stretch: 1;
+                            Text {
+                                text: row.hidden && !row.unlocked ? "???" : row.display_name;
+                                font-weight: Typography.heading-weight;
+                                color: Palette.text;
+                            }
+                            Text {
+                                text: row.hidden && !row.unlocked ? "Hidden achievement" : row.description;
+                                wrap: word-wrap;
+                                font-size: Typography.meta;
+                                color: Palette.neutral-700;
+                            }
+                        }
+                        VerticalLayout {
+                            alignment: center;
+                            Text {
+                                text: row.unlocked ? "Unlocked" : "Locked";
+                                color: row.unlocked ? Palette.accent-700 : Palette.neutral-600;
+                                font-size: Typography.meta;
+                                font-weight: Typography.heading-weight;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

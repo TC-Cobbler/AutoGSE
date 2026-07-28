@@ -1,0 +1,300 @@
+import { LineEdit, ScrollView } from "std-widgets.slint";
+import { Palette, Typography, Spacing } from "theme.slint";
+import { AGButton, AGButtonVariant, AGIconButton, AGTag, AGTagVariant, AGCard, AGElevation, AGHr } from "components.slint";
+import { IconRefresh, IconSearch, IconHeart, IconArrowUp, IconGear, IconTrophy, IconUsers, IconDownload } from "icons.slint";
+
+// Re-exported so `slint::include_modules!()` generates Rust bindings for
+// these too (Phase 7 §7.6/§7.4/§7.5) — each dialog is shown directly from
+// Rust, never referenced by `MainWindow` itself.
+import { CandidateRow, DisambiguationDialog } from "disambiguation.slint";
+export { CandidateRow, DisambiguationDialog }
+import { ConfigEditorDialog, ConfigFileRow, IniSectionRow, IniEntryRow, DlcRow, PersonaRow, ModRow } from "config_editor.slint";
+export { ConfigEditorDialog, ConfigFileRow, IniSectionRow, IniEntryRow, DlcRow, PersonaRow, ModRow }
+import { AchievementsDialog, AchievementRow } from "achievements.slint";
+export { AchievementsDialog, AchievementRow }
+import { OverlaySettingsDialog } from "overlay_settings.slint";
+export { OverlaySettingsDialog }
+import { DoctorDialog, ToolCheckRow } from "doctor.slint";
+export { DoctorDialog, ToolCheckRow }
+import { SaveSyncDialog, BackupSnapshotRow } from "save_sync.slint";
+export { SaveSyncDialog, BackupSnapshotRow }
+import { LoginDialog } from "login.slint";
+export { LoginDialog }
+import { DropConfirmDialog } from "drop_confirm.slint";
+export { DropConfirmDialog }
+import { MultiplayerDialog, TailscalePeerRow } from "multiplayer.slint";
+export { MultiplayerDialog, TailscalePeerRow }
+
+export struct ScanRow {
+    path: string,
+    status: string,
+    title: string,
+    header_image: image,
+}
+
+// Phase 7 §7.8.1: dashboard rebuilt as a card grid on the Modernist design
+// system (`theme.slint`/`components.slint`/`icons.slint`), replacing the
+// pre-§7.8 vertical text-row list. Every existing callback/property name is
+// kept identical to what `autogse_gui.rs` already binds to — this is a
+// restyle plus additive features (filter, per-card action icons, a wired
+// "Check for Updates"), not a functional rewrite of what already worked.
+export component MainWindow inherits Window {
+    title: "AutoGSE";
+    preferred-width: 1200px;
+    preferred-height: 820px;
+    background: Palette.bg;
+
+    in-out property <string> root_path: "";
+    in property <[ScanRow]> rows: [];
+    // Every row from the last scan, unfiltered — `filter_changed`'s Rust
+    // handler reads this back to re-derive `rows` without a second scan, and
+    // it's a Slint property (not separate Rust-side shared state) precisely
+    // so both the scan-completion handler (running inside
+    // `slint::invoke_from_event_loop`, whose closure must itself be `Send`)
+    // and the filter callback (which fires directly on the UI thread) can
+    // touch it through the same `Weak<MainWindow>` mechanism every other
+    // property here already uses safely.
+    in-out property <[ScanRow]> all_rows: [];
+    in property <bool> scanning: false;
+    in property <string> status_message: "Enter a games-library root folder and click Scan.";
+
+    in-out property <string> appid_target_path: "";
+    in property <bool> resolving_appid: false;
+    in property <string> appid_result_message: "";
+
+    in property <string> config_editor_status_message: "";
+    in property <string> achievements_status_message: "";
+
+    in-out property <string> filter_text: "";
+    in property <string> join_lobby_status_message: "";
+    in property <string> update_status_message: "";
+
+    callback scan_requested(string);
+    callback resolve_appid_requested(string);
+    callback open_config_editor_requested(string);
+    callback open_achievements_requested(string);
+    callback filter_changed(string);
+    callback join_lobby_requested(string);
+    callback check_for_updates_requested();
+    // Milestones 5/6/7 — dialogs don't exist yet, so these buttons render
+    // disabled today (see `enabled: false` below) rather than wired to
+    // nothing; each becomes a real callback + dialog when its milestone lands.
+    callback open_steam_login_requested();
+    callback open_overlay_settings_requested();
+    callback open_doctor_requested();
+    callback open_multiplayer_requested();
+    callback open_save_sync_requested(string);
+
+    VerticalLayout {
+        padding: Spacing.space-3;
+        spacing: Spacing.space-2;
+
+        HorizontalLayout {
+            spacing: Spacing.space-2;
+            height: 36px;
+            Text {
+                text: "AutoGSE";
+                font-weight: Typography.heading-weight;
+                font-size: Typography.h5;
+                color: Palette.text;
+                vertical-alignment: center;
+            }
+            Rectangle {
+                horizontal-stretch: 1;
+                background: white;
+                border-width: 2px;
+                border-color: Palette.text;
+                HorizontalLayout {
+                    padding-left: Spacing.space-2;
+                    root_input := LineEdit {
+                        placeholder-text: "Games-library root folder...";
+                        text <=> root_path;
+                    }
+                }
+            }
+            AGButton {
+                text: scanning ? "Scanning..." : "Scan";
+                variant: AGButtonVariant.primary;
+                enabled: !scanning;
+                clicked => { scan_requested(root_input.text); }
+            }
+        }
+
+        HorizontalLayout {
+            spacing: Spacing.space-2;
+            height: 36px;
+            Rectangle {
+                horizontal-stretch: 1;
+                background: white;
+                border-width: 2px;
+                border-color: Palette.text;
+                HorizontalLayout {
+                    padding-left: Spacing.space-2;
+                    spacing: Spacing.space-1;
+                    IconSearch {
+                        y: (parent.height - self.height) / 2;
+                    }
+                    filter_input := LineEdit {
+                        placeholder-text: "Filter by title or status...";
+                        text <=> filter_text;
+                        edited => { filter_changed(self.text); }
+                    }
+                }
+            }
+            AGButton {
+                text: "Steam Login";
+                clicked => { open_steam_login_requested(); }
+            }
+            AGButton {
+                text: "Overlay Settings";
+                clicked => { open_overlay_settings_requested(); }
+            }
+            AGButton {
+                text: "Doctor";
+                clicked => { open_doctor_requested(); }
+            }
+            AGButton {
+                text: "Check for Updates";
+                clicked => { check_for_updates_requested(); }
+            }
+            AGButton {
+                text: "Multiplayer";
+                clicked => { open_multiplayer_requested(); }
+            }
+        }
+
+        Text {
+            text: status_message;
+            color: Palette.text;
+            wrap: word-wrap;
+            font-size: Typography.meta;
+        }
+
+        AGHr { }
+
+        ScrollView {
+            VerticalLayout {
+                alignment: start;
+                spacing: Spacing.space-4;
+
+                HorizontalLayout {
+                    spacing: Spacing.space-4;
+                    alignment: start;
+
+                    for row in rows: AGCard {
+                        elevation: AGElevation.sm;
+                        width: 260px;
+
+                        Image {
+                            source: row.header_image;
+                            width: 100%;
+                            height: 130px;
+                        }
+                        VerticalLayout {
+                            padding: Spacing.space-2;
+                            spacing: Spacing.space-1;
+
+                            Text {
+                                text: row.title;
+                                font-weight: Typography.heading-weight;
+                                font-size: Typography.label;
+                                color: Palette.text;
+                                wrap: word-wrap;
+                            }
+                            Text {
+                                text: row.path;
+                                font-size: Typography.meta;
+                                color: Palette.neutral-700;
+                                wrap: word-wrap;
+                            }
+                            AGTag {
+                                text: row.status;
+                                variant: row.status == "injected" ? AGTagVariant.accent : (row.status == "needs update" ? AGTagVariant.outline : AGTagVariant.neutral);
+                            }
+                            HorizontalLayout {
+                                spacing: Spacing.space-1;
+                                padding-top: Spacing.space-1;
+
+                                AGIconButton {
+                                    enabled: false;
+                                    IconArrowUp { }
+                                }
+                                AGIconButton {
+                                    clicked => { open_config_editor_requested(row.path); }
+                                    IconGear { }
+                                }
+                                AGIconButton {
+                                    clicked => { open_achievements_requested(row.path); }
+                                    IconTrophy { }
+                                }
+                                AGIconButton {
+                                    clicked => { join_lobby_requested(row.path); }
+                                    IconUsers { }
+                                }
+                                AGIconButton {
+                                    clicked => { open_save_sync_requested(row.path); }
+                                    IconDownload { }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Text {
+            // Every action-icon/toolbar-button status collapses into one
+            // line, most-recent-nonempty-wins is good enough here — this
+            // row exists so `open_config_editor_requested`/
+            // `open_achievements_requested`/`join_lobby_requested`/
+            // `check_for_updates_requested`'s feedback (previously each its
+            // own labeled text row) still reaches the user now that those
+            // actions are triggered from per-card icons instead of a
+            // manual-entry row.
+            text: join_lobby_status_message != "" ? join_lobby_status_message
+                : (update_status_message != "" ? update_status_message
+                : (config_editor_status_message != "" ? config_editor_status_message
+                : achievements_status_message));
+            color: Palette.text;
+            wrap: word-wrap;
+            font-size: Typography.meta;
+        }
+
+        AGHr { }
+
+        Text {
+            text: "Resolve Steam App ID — type a path, or drag a game folder/exe anywhere onto this window: exercises the real Step 1-5 cascade, including the visual disambiguation dialog when Step 4's automatic match isn't confident.";
+            wrap: word-wrap;
+            font-size: Typography.meta;
+            color: Palette.neutral-700;
+        }
+        HorizontalLayout {
+            spacing: Spacing.space-2;
+            height: 36px;
+            Rectangle {
+                horizontal-stretch: 1;
+                background: white;
+                border-width: 2px;
+                border-color: Palette.text;
+                HorizontalLayout {
+                    padding-left: Spacing.space-2;
+                    appid_path_input := LineEdit {
+                        placeholder-text: "Game folder or executable...";
+                        text <=> appid_target_path;
+                    }
+                }
+            }
+            AGButton {
+                text: resolving_appid ? "Resolving..." : "Resolve App ID";
+                enabled: !resolving_appid;
+                clicked => { resolve_appid_requested(appid_path_input.text); }
+            }
+        }
+        Text {
+            text: appid_result_message;
+            color: Palette.text;
+            wrap: word-wrap;
+            font-size: Typography.meta;
+        }
+    }
+}
