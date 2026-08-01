@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use crate::error::AutoGseError;
 use crate::pe::Arch;
+use crate::secret::SecretString;
 
 const GENERATE_EMU_CONFIG_TIMEOUT_ANON: Duration = Duration::from_secs(60);
 
@@ -29,7 +30,7 @@ const GENERATE_EMU_CONFIG_TIMEOUT_AUTH: Duration = Duration::from_secs(180);
 #[derive(Clone)]
 pub enum AuthMode {
     Anonymous,
-    Authenticated { username: String, password: String },
+    Authenticated { username: SecretString, password: SecretString },
 }
 
 /// Phase 6 §6.2: controller/inventory generation are separately-billed,
@@ -398,7 +399,7 @@ pub fn run_generate_emu_config(app_id: u64, out_dir: &Path, auth: &AuthMode, opt
             // login is controlled purely by `-anon`'s absence); AutoGSE
             // always supplies fresh credentials via env vars on every
             // invocation anyway, so that cache is never relied upon.
-            cmd.args(["-acw"]).env("GSE_CFG_USERNAME", username).env("GSE_CFG_PASSWORD", password);
+            cmd.args(["-acw"]).env("GSE_CFG_USERNAME", username.as_str()).env("GSE_CFG_PASSWORD", password.as_str());
             GENERATE_EMU_CONFIG_TIMEOUT_AUTH
         }
     };
@@ -808,8 +809,8 @@ mod tests {
     #[test]
     #[ignore]
     fn live_run_generate_emu_config_authenticated() {
-        let username = std::env::var("AUTOGSE_TEST_STEAM_USERNAME").expect("set AUTOGSE_TEST_STEAM_USERNAME");
-        let password = std::env::var("AUTOGSE_TEST_STEAM_PASSWORD").expect("set AUTOGSE_TEST_STEAM_PASSWORD");
+        let username = SecretString::new(std::env::var("AUTOGSE_TEST_STEAM_USERNAME").expect("set AUTOGSE_TEST_STEAM_USERNAME"));
+        let password = SecretString::new(std::env::var("AUTOGSE_TEST_STEAM_PASSWORD").expect("set AUTOGSE_TEST_STEAM_PASSWORD"));
         let out_dir = TempDir::new().unwrap();
         run_generate_emu_config(105600, out_dir.path(), &AuthMode::Authenticated { username, password }, GenOptions::default()).unwrap(); // 105600 = Terraria
         assert!(out_dir.path().join("steam_settings/achievements.json").is_file());

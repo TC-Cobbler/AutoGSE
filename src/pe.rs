@@ -21,6 +21,19 @@ impl fmt::Display for Arch {
     }
 }
 
+impl Arch {
+    /// Inverse of `Display`, for reading `GseManifest.arch` back out (Phase
+    /// 11 §11.3's `reinject` needs to re-resolve the vendored DLL source for
+    /// an already-injected target without re-running PE bitness detection).
+    pub fn parse(s: &str) -> Option<Arch> {
+        match s {
+            "x86" => Some(Arch::X86),
+            "x64" => Some(Arch::X64),
+            _ => None,
+        }
+    }
+}
+
 /// Reads `IMAGE_DOS_HEADER.e_lfanew` -> `IMAGE_NT_HEADERS.FileHeader.Machine`
 /// to determine whether `path` is a 32-bit or 64-bit PE image (PRD §5.2.3).
 pub fn read_bitness(path: &Path) -> Result<Arch, AutoGseError> {
@@ -201,6 +214,13 @@ mod tests {
         let mut buf = synthetic_pe(IMAGE_FILE_MACHINE_AMD64);
         buf[0x80..0x84].copy_from_slice(b"XXXX");
         assert_eq!(parse_bitness(&buf), None);
+    }
+
+    #[test]
+    fn arch_parse_round_trips_through_display() {
+        assert_eq!(Arch::parse(&Arch::X86.to_string()), Some(Arch::X86));
+        assert_eq!(Arch::parse(&Arch::X64.to_string()), Some(Arch::X64));
+        assert_eq!(Arch::parse("arm64"), None);
     }
 
     #[test]

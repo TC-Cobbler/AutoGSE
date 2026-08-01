@@ -34,10 +34,12 @@ use std::time::Duration;
 
 use md5::{Digest, Md5};
 use serde::{Deserialize, Serialize};
+use zeroize::Zeroizing;
 
 use crate::credentials::{dpapi_protect, dpapi_unprotect, store_dir};
 use crate::error::AutoGseError;
 use crate::notify;
+use crate::secret::SecretString;
 
 const API_BASE: &str = "https://retroachievements.org/API";
 const BADGE_BASE: &str = "https://i.retroachievements.org/Badge";
@@ -54,8 +56,8 @@ const MAX_RESPONSE_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct RaCredentials {
-    pub username: String,
-    pub api_key: String,
+    pub username: SecretString,
+    pub api_key: SecretString,
 }
 
 fn ra_credentials_path(dir: &Path) -> PathBuf {
@@ -64,7 +66,7 @@ fn ra_credentials_path(dir: &Path) -> PathBuf {
 
 pub fn save_in(dir: &Path, creds: &RaCredentials) -> Result<(), AutoGseError> {
     std::fs::create_dir_all(dir)?;
-    let mut plaintext = serde_json::to_vec(creds)?;
+    let mut plaintext = Zeroizing::new(serde_json::to_vec(creds)?);
     let encrypted = dpapi_protect(&mut plaintext)?;
     std::fs::write(ra_credentials_path(dir), encrypted)?;
     Ok(())
@@ -76,7 +78,7 @@ pub fn load_in(dir: &Path) -> Result<Option<RaCredentials>, AutoGseError> {
         return Ok(None);
     }
     let mut encrypted = std::fs::read(&path)?;
-    let decrypted = dpapi_unprotect(&mut encrypted)?;
+    let decrypted = Zeroizing::new(dpapi_unprotect(&mut encrypted)?);
     Ok(Some(serde_json::from_slice(&decrypted)?))
 }
 
@@ -209,8 +211,8 @@ pub fn fetch_game_progress(creds: &RaCredentials, game_id: u64, timeout: Duratio
     let agent = build_agent(timeout);
     let mut response = agent
         .get(format!("{API_BASE}/API_GetGameInfoAndUserProgress.php"))
-        .query("y", &creds.api_key)
-        .query("u", &creds.username)
+        .query("y", creds.api_key.as_str())
+        .query("u", creds.username.as_str())
         .query("g", game_id.to_string())
         .call()
         .map_err(|e| AutoGseError::RetroAchievements(format!("GetGameInfoAndUserProgress failed: {e}")))?;
@@ -255,7 +257,7 @@ pub fn fetch_game_list_with_hashes(creds: &RaCredentials, console_id: u64, timeo
     let agent = build_agent(timeout);
     let mut response = agent
         .get(format!("{API_BASE}/API_GetGameList.php"))
-        .query("y", &creds.api_key)
+        .query("y", creds.api_key.as_str())
         .query("i", console_id.to_string())
         .query("h", "1")
         .call()
@@ -457,7 +459,7 @@ mod tests {
     use super::*;
 
     fn sample_creds() -> RaCredentials {
-        RaCredentials { username: "retro_user".to_string(), api_key: "abc123secret".to_string() }
+        RaCredentials { username: SecretString::new("retro_user".to_string()), api_key: SecretString::new("abc123secret".to_string()) }
     }
 
     #[test]

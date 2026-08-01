@@ -1,0 +1,29 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    Phase 11 §11.4: a Playnite extension is a separate .NET/C# toolchain from
+    the rest of this repo (Rust) — it isn't built by `cargo build` and isn't
+    part of the workspace `Cargo.toml` sets up for the §11.1 shell extension.
+    Targets net462 because that's the framework Playnite's own extension
+    host loads plugins into (confirmed via PlayniteSDK's own package target),
+    not a project preference.
+  -->
+  <PropertyGroup>
+    <TargetFramework>net462</TargetFramework>
+    <AssemblyName>AutoGSEPlaynitePlugin</AssemblyName>
+    <RootNamespace>AutoGSEPlaynitePlugin</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>disable</Nullable>
+    <GenerateAssemblyInfo>false</GenerateAssemblyInfo>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="PlayniteSDK" Version="6.11.0" />
+    <PackageReference Include="System.Text.Json" Version="8.0.5" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Include="extension.yaml" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+</Project>

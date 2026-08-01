@@ -1,0 +1,24 @@
+[package]
+name = "autogse-shell"
+version = "0.1.0"
+edition = "2024"
+license = "GPL-2.0-only"
+
+# Real Win32 COM in-process server DLL (Phase 11 §11.1), loaded directly by
+# Explorer via the `ExplorerCommandHandler` registry value `registry.rs`
+# writes — not an ordinary Rust library, so this must be a `cdylib`.
+[lib]
+name = "autogse_shell"
+crate-type = ["cdylib"]
+
+[dependencies]
+# Reuses `engine::classify_target`/`ScanStatus` directly instead of
+# duplicating the injected/vanilla/needs-update/update-reverted logic here.
+autogse = { path = ".." }
+windows = { version = "0.62.2", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_UI_Shell",
+    "Win32_System_LibraryLoader",
+] }
+windows-core = "0.62.2"

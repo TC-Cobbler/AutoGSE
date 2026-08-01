@@ -30,10 +30,11 @@ UninstallDisplayIcon={app}\{#MyAppExeName}
 
 [Files]
 Source: "{#RepoRoot}target\release\autogse.exe"; DestDir: "{app}"; Flags: ignoreversion
-; Phase 7: the GUI is a separate optional binary alongside the CLI, not a
-; replacement for it — same install location, own context-menu-free entry
-; point (launched from the Start Menu shortcut, not a verb).
-Source: "{#RepoRoot}target\release\autogse-gui.exe"; DestDir: "{app}"; Flags: ignoreversion
+; Phase 11 §11.1: the IExplorerCommand COM shell extension DLL. Must land in
+; the same directory as autogse.exe — registry.rs's install_context_menu
+; resolves this DLL's path as a sibling of autogse.exe's own current_exe(),
+; not via a separate configurable location.
+Source: "{#RepoRoot}target\release\autogse_shell.dll"; DestDir: "{app}"; Flags: ignoreversion
 ; Vendored alex47exe/gse_fork tooling. The destination folder name
 ; ("gen_emu_cfg") is not arbitrary — it's exactly what
 ; goldberg::tools_root()'s release-mode branch expects beside the exe, per

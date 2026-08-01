@@ -14,14 +14,70 @@ use serde::Deserialize;
 
 use crate::error::AutoGseError;
 
+/// A real `achievements.json`'s `displayName`/`description` value is
+/// sometimes a plain string (the vendored tree's static example, and every
+/// game tested through Phase 5/7) and sometimes a per-language object
+/// (confirmed live against a real generated file for METAL GEAR SOLID Δ:
+/// SNAKE EATER/2417610, whose real Steam store data carries full
+/// localization: `{"english": "...", "german": "...", ...}`) — both are real
+/// shapes `generate_emu_config.exe` can produce depending on what Steam
+/// actually returned for that game, not a malformed file either way.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum FlexibleText {
+    Plain(String),
+    Localized(HashMap<String, String>),
+}
+
+impl FlexibleText {
+    fn resolve(self) -> String {
+        match self {
+            FlexibleText::Plain(s) => s,
+            // Prefer English if present (matches this codebase's existing
+            // English-first convention elsewhere, e.g. RA badge/game-title
+            // display); otherwise take whatever the map has, since an
+            // achievement in *some* real language beats one with no text
+            // at all.
+            FlexibleText::Localized(map) => map.get("english").cloned().or_else(|| map.values().next().cloned()).unwrap_or_default(),
+        }
+    }
+}
+
+/// Same real-vs-example divergence as `FlexibleText`: the static example
+/// writes `hidden` as a string (`"0"`/`"1"`), but a real generated file can
+/// carry it as a plain JSON integer instead (confirmed live against the
+/// same real MGS Δ file — `"hidden": 1`).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+enum FlexibleHidden {
+    Str(String),
+    Num(i64),
+}
+
+impl FlexibleHidden {
+    fn is_hidden(&self) -> bool {
+        match self {
+            FlexibleHidden::Str(s) => s == "1",
+            FlexibleHidden::Num(n) => *n == 1,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct RawAchievement {
     name: String,
     #[serde(rename = "displayName")]
-    display_name: String,
-    description: Option<String>,
-    hidden: Option<String>,
+    display_name: FlexibleText,
+    description: Option<FlexibleText>,
+    hidden: Option<FlexibleHidden>,
     icon: Option<String>,
+    // Confirmed live against the same real MGS Δ file: this real generated
+    // tree used `icon_gray` (an underscore), not the vendored static
+    // example's `icongray` — same class of static-example-vs-real-output
+    // divergence this project has hit before (Phase 5's `img`/`images`
+    // folder-name correction). Accepting both rather than picking one
+    // avoids repeating that mistake in either direction.
+    #[serde(rename = "icongray", alias = "icon_gray")]
     icongray: Option<String>,
 }
 
@@ -38,6 +94,12 @@ pub struct Achievement {
     pub icon_path: Option<PathBuf>,
     pub icon_gray_path: Option<PathBuf>,
     pub unlocked: bool,
+    /// Unix epoch seconds, from the runtime unlock file's `earned_time` —
+    /// `None` until merged via `load_with_unlock_state` (or if that
+    /// achievement was never earned). Phase 13's `export-achievements`
+    /// needs this; `load_definitions` alone has no unlock data at all to
+    /// populate it from.
+    pub unlocked_at: Option<u64>,
 }
 
 /// Reads `steam_settings/achievements.json` and resolves each entry's
@@ -65,12 +127,13 @@ pub fn load_definitions(tod: &Path) -> Result<Vec<Achievement>, AutoGseError> {
         .into_iter()
         .map(|a| Achievement {
             name: a.name,
-            display_name: a.display_name,
-            description: a.description.unwrap_or_default(),
-            hidden: a.hidden.as_deref() == Some("1"),
+            display_name: a.display_name.resolve(),
+            description: a.description.map(FlexibleText::resolve).unwrap_or_default(),
+            hidden: a.hidden.map(|h| h.is_hidden()).unwrap_or(false),
             icon_path: resolve_icon(&settings_dir, a.icon.as_deref()),
             icon_gray_path: resolve_icon(&settings_dir, a.icongray.as_deref()),
             unlocked: false,
+            unlocked_at: None,
         })
         .collect())
 }
@@ -87,12 +150,26 @@ fn resolve_icon(settings_dir: &Path, rel: Option<&str>) -> Option<PathBuf> {
 /// One entry in the *runtime* unlock-state file (`{"ACH_001": {"earned":
 /// true, "earned_time": 1784651841}}`) — a different file, at a different
 /// path, from the schema `achievements.json` `load_definitions` reads,
-/// despite sharing the same filename. `earned_time` is parsed but not
-/// currently surfaced anywhere; kept only so an unexpected extra field in a
-/// real save file doesn't fail deserialization of the field we do need.
+/// despite sharing the same filename. `earned_time` (Unix epoch seconds) is
+/// `#[serde(default)]` since it's absent in this codebase's own older test
+/// fixtures — never actually seen missing on a real save file, but no reason
+/// to make that a hard requirement.
 #[derive(Debug, Deserialize)]
 struct RawUnlockEntry {
     earned: bool,
+    #[serde(default)]
+    earned_time: Option<u64>,
+}
+
+/// `load_unlock_state`'s per-achievement result — `earned`, matching
+/// `RawUnlockEntry`'s field 1:1 (this isn't just the raw JSON shape
+/// reused as-is: it's the module's public, stable return type, kept
+/// separate from `RawUnlockEntry` so a future wire-format change doesn't
+/// silently change this function's signature).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnlockState {
+    pub earned: bool,
+    pub earned_at: Option<u64>,
 }
 
 /// Resolves the on-disk location of the *runtime* unlock-state file, i.e.
@@ -134,15 +211,15 @@ pub fn unlock_state_target_path(tod: &Path, configs_user_ini: &Path, app_id: u64
         .map(|root| root.join(app_id.to_string()).join("achievements.json"))
 }
 
-/// Parses the runtime unlock-state file into `name -> earned`. Returns an
-/// empty map (not an error) when the file doesn't exist yet, same
+/// Parses the runtime unlock-state file into `name -> UnlockState`. Returns
+/// an empty map (not an error) when the file doesn't exist yet, same
 /// "nothing earned yet" convention as `load_definitions`' missing-schema case.
-pub fn load_unlock_state(path: &Path) -> Result<HashMap<String, bool>, AutoGseError> {
+pub fn load_unlock_state(path: &Path) -> Result<HashMap<String, UnlockState>, AutoGseError> {
     if !path.is_file() {
         return Ok(HashMap::new());
     }
     let raw: HashMap<String, RawUnlockEntry> = serde_json::from_slice(&std::fs::read(path)?)?;
-    Ok(raw.into_iter().map(|(name, entry)| (name, entry.earned)).collect())
+    Ok(raw.into_iter().map(|(name, entry)| (name, UnlockState { earned: entry.earned, earned_at: entry.earned_time })).collect())
 }
 
 /// `load_definitions` plus, when resolvable, real unlock status merged in by
@@ -161,8 +238,9 @@ pub fn load_with_unlock_state(tod: &Path, app_id: Option<u64>) -> Result<Vec<Ach
     if let Some(unlock_path) = resolve_unlock_state_path(tod, &configs_user_ini, app_id) {
         if let Ok(state) = load_unlock_state(&unlock_path) {
             for a in &mut achievements {
-                if let Some(&earned) = state.get(&a.name) {
-                    a.unlocked = earned;
+                if let Some(entry) = state.get(&a.name) {
+                    a.unlocked = entry.earned;
+                    a.unlocked_at = entry.earned_at;
                 }
             }
         }
@@ -293,6 +371,53 @@ mod tests {
         assert!(!result[0].hidden);
     }
 
+    /// Real, live-discovered shape confirmed on this machine (METAL GEAR
+    /// SOLID Δ: SNAKE EATER, AppID 2417610): `hidden` as a plain integer,
+    /// and `displayName`/`description` as a per-language object rather than
+    /// a bare string. Before this fix, `load_definitions` (and therefore
+    /// `export-achievements`) hard-failed on this exact real file with
+    /// `invalid type: integer 1, expected a string`.
+    #[test]
+    fn load_definitions_parses_a_real_localized_and_numeric_hidden_shape() {
+        let dir = tempfile::tempdir().unwrap();
+        write_achievements_json(
+            dir.path(),
+            r#"[{
+                "hidden": 1,
+                "displayName": {"english": "Young Gun", "german": "Junger Wilder", "token": "NEW_ACHIEVEMENT_1_0_NAME"},
+                "description": {"english": "Stun Ocelot", "german": "Ocelot betäuben.", "token": "NEW_ACHIEVEMENT_1_0_DESC"},
+                "icon": "img/a.jpg",
+                "icon_gray": "img/a_gray.jpg",
+                "name": "ACHIEVEMENT_2"
+            }]"#,
+        );
+
+        let result = load_definitions(dir.path()).unwrap();
+        assert_eq!(result.len(), 1);
+        assert!(result[0].hidden, "a plain JSON integer 1 must be treated the same as the string \"1\"");
+        assert_eq!(result[0].display_name, "Young Gun", "must prefer the english localization");
+        assert_eq!(result[0].description, "Stun Ocelot");
+    }
+
+    #[test]
+    fn load_definitions_falls_back_to_any_language_when_english_is_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        write_achievements_json(dir.path(), r#"[{"displayName": {"german": "Nur Deutsch"}, "name": "Achievement_0"}]"#);
+
+        assert_eq!(load_definitions(dir.path()).unwrap()[0].display_name, "Nur Deutsch");
+    }
+
+    #[test]
+    fn load_definitions_accepts_icon_gray_with_an_underscore() {
+        let dir = tempfile::tempdir().unwrap();
+        let img_dir = dir.path().join("steam_settings").join("img");
+        std::fs::create_dir_all(&img_dir).unwrap();
+        std::fs::write(img_dir.join("a_gray.jpg"), b"fake jpg").unwrap();
+        write_achievements_json(dir.path(), r#"[{"displayName":"n","icon_gray":"img/a_gray.jpg","name":"Achievement_0"}]"#);
+
+        assert_eq!(load_definitions(dir.path()).unwrap()[0].icon_gray_path, Some(img_dir.join("a_gray.jpg")));
+    }
+
     fn write_configs_user_ini(tod: &Path, content: &str) -> PathBuf {
         let dir = tod.join("steam_settings");
         std::fs::create_dir_all(&dir).unwrap();
@@ -363,8 +488,18 @@ mod tests {
         std::fs::write(&path, r#"{"ACH_001":{"earned":true,"earned_time":1784651841},"ACH_003":{"earned":false,"earned_time":0}}"#).unwrap();
 
         let state = load_unlock_state(&path).unwrap();
-        assert_eq!(state.get("ACH_001"), Some(&true));
-        assert_eq!(state.get("ACH_003"), Some(&false));
+        assert_eq!(state.get("ACH_001"), Some(&UnlockState { earned: true, earned_at: Some(1784651841) }));
+        assert_eq!(state.get("ACH_003"), Some(&UnlockState { earned: false, earned_at: Some(0) }));
+    }
+
+    #[test]
+    fn load_unlock_state_tolerates_a_missing_earned_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("achievements.json");
+        std::fs::write(&path, r#"{"ACH_001":{"earned":true}}"#).unwrap();
+
+        let state = load_unlock_state(&path).unwrap();
+        assert_eq!(state.get("ACH_001"), Some(&UnlockState { earned: true, earned_at: None }));
     }
 
     #[test]
@@ -407,7 +542,9 @@ mod tests {
 
         let state = load_unlock_state(&real_unlock_path).unwrap();
         assert!(!state.is_empty());
-        assert_eq!(state.get("ACH_001"), Some(&true));
+        let ach_001 = state.get("ACH_001").expect("ACH_001 should be present in real save data");
+        assert!(ach_001.earned);
+        assert!(ach_001.earned_at.is_some(), "a real earned achievement should carry a real earned_time");
 
         // And through the full resolver, using this project's own default
         // saves_folder_name (no local_save_path override) — a synthetic TOD

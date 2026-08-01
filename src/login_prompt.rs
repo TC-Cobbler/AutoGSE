@@ -3,10 +3,12 @@ use std::io::{BufRead, Write};
 use windows::Win32::System::Console::{
     GetConsoleMode, GetStdHandle, SetConsoleMode, ENABLE_ECHO_INPUT, STD_INPUT_HANDLE,
 };
+use zeroize::Zeroizing;
 
 use crate::credentials::Credentials;
 use crate::error::AutoGseError;
 use crate::retroachievements::RaCredentials;
+use crate::secret::SecretString;
 
 const RULE: &str = "===================================================================";
 
@@ -91,7 +93,7 @@ fn print_login_header<W: Write>(writer: &mut W) {
 /// same OS-interaction boundary as `notify.rs`/`shortcut.rs`. Falls back to
 /// a plain (visible) read if no console is attached (e.g. output piped)
 /// rather than failing the whole login.
-fn read_password_stdio() -> Result<String, AutoGseError> {
+fn read_password_stdio() -> Result<SecretString, AutoGseError> {
     let handle = unsafe { GetStdHandle(STD_INPUT_HANDLE) }
         .map_err(|e| AutoGseError::LoginFailed(format!("could not access console input: {e}")))?;
 
@@ -102,7 +104,10 @@ fn read_password_stdio() -> Result<String, AutoGseError> {
         let _ = unsafe { SetConsoleMode(handle, masked_mode) };
     }
 
-    let mut password = String::new();
+    // Zeroized on drop even on an early `?` return below — the raw,
+    // un-trimmed buffer holds the same plaintext as the trimmed copy this
+    // function returns, and would otherwise just leak to freed memory.
+    let mut password = Zeroizing::new(String::new());
     let read_result = std::io::stdin().read_line(&mut password);
 
     if has_console {
@@ -110,7 +115,7 @@ fn read_password_stdio() -> Result<String, AutoGseError> {
     }
 
     read_result.map_err(AutoGseError::Io)?;
-    Ok(password.trim_end_matches(['\r', '\n']).to_string())
+    Ok(SecretString::new(password.trim_end_matches(['\r', '\n']).to_string()))
 }
 
 /// The `login` subcommand's capture flow, and the target of the disclosure
@@ -121,7 +126,7 @@ pub fn capture_login_stdio() -> Result<Credentials, AutoGseError> {
 
     let _ = write!(stdout, " Steam username: ");
     let _ = stdout.flush();
-    let mut username = String::new();
+    let mut username = Zeroizing::new(String::new());
     std::io::stdin().read_line(&mut username)?;
     let username = username.trim().to_string();
     if username.is_empty() {
@@ -132,11 +137,11 @@ pub fn capture_login_stdio() -> Result<Credentials, AutoGseError> {
     let _ = stdout.flush();
     let password = read_password_stdio()?;
     let _ = writeln!(stdout);
-    if password.is_empty() {
+    if password.as_str().is_empty() {
         return Err(AutoGseError::LoginFailed("no password entered".to_string()));
     }
 
-    Ok(Credentials { username, password })
+    Ok(Credentials { username: SecretString::new(username), password })
 }
 
 /// Phase 7 §7.7's `ra-login` subcommand: same masked-input pattern as
@@ -158,7 +163,7 @@ pub fn capture_ra_login_stdio() -> Result<RaCredentials, AutoGseError> {
 
     let _ = write!(stdout, " RetroAchievements username: ");
     let _ = stdout.flush();
-    let mut username = String::new();
+    let mut username = Zeroizing::new(String::new());
     std::io::stdin().read_line(&mut username)?;
     let username = username.trim().to_string();
     if username.is_empty() {
@@ -169,11 +174,11 @@ pub fn capture_ra_login_stdio() -> Result<RaCredentials, AutoGseError> {
     let _ = stdout.flush();
     let api_key = read_password_stdio()?;
     let _ = writeln!(stdout);
-    if api_key.is_empty() {
+    if api_key.as_str().is_empty() {
         return Err(AutoGseError::RetroAchievements("no API key entered".to_string()));
     }
 
-    Ok(RaCredentials { username, api_key })
+    Ok(RaCredentials { username: SecretString::new(username), api_key })
 }
 
 #[cfg(test)]

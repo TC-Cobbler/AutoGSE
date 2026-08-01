@@ -68,7 +68,10 @@ fn run(command: Command) -> Result<(), AutoGseError> {
         Command::AddMod(args) => engine::run_add_mod(&args),
         Command::Join(args) => engine::run_join(&args, &interaction),
         Command::Scan(args) => engine::run_scan(&args),
-        Command::List => engine::run_list(),
+        Command::List(args) => engine::run_list(&args),
+        Command::Reinject(args) => engine::run_reinject(&args),
+        Command::Repair(args) => engine::run_repair(&args),
+        Command::Audit(args) => engine::run_audit(&args),
         Command::Doctor => engine::run_doctor(),
         Command::CheckUpdate => engine::run_check_update(),
         Command::SyncSaves(args) => engine::run_sync_saves(&args),
@@ -79,5 +82,7 @@ fn run(command: Command) -> Result<(), AutoGseError> {
         Command::Lan(args) => engine::run_lan(&args),
         Command::Export(args) => engine::run_export(&args),
         Command::Import(args) => engine::run_import(&args),
+        Command::ExportAchievements(args) => engine::run_export_achievements(&args),
+        Command::Rpcs3Trophies(args) => engine::run_rpcs3_trophies(&args),
     }
 }

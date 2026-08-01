@@ -8,7 +8,7 @@ pub const MANIFEST_FILENAME: &str = ".gse_manifest.json";
 pub const MANIFEST_VERSION: &str = "1.0.0";
 
 /// PRD §5.5.2's real manifest schema.
-#[derive(Debug, Serialize, Deserialize, Clone)]
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct BackedUpFile {
     pub original_path: String,
     pub backup_path: String,

@@ -82,7 +82,26 @@ pub enum Command {
     /// Enumerate every folder AutoGSE has touched on this machine (a local
     /// index keyed off known `.gse_manifest.json` locations), so you can
     /// find all injected games without remembering where they are.
-    List,
+    List(ListArgs),
+
+    /// Restages the Goldberg emulator DLL after a Steam update silently
+    /// overwrote it with a vanilla copy (see `scan`/`list`'s "steam update
+    /// reverted" status). Preserves the existing steam_settings/ and any
+    /// custom configuration already on disk — does not regenerate anything.
+    Reinject(ReinjectArgs),
+
+    /// Diagnoses (and, where safely possible, fixes) a single corrupted or
+    /// interrupted injection: a `.org` backup whose hash no longer matches
+    /// `.gse_manifest.json`, a manifest schema older than this binary
+    /// supports, or a DLL that was swapped mid-inject before a manifest was
+    /// ever written at all.
+    Repair(RepairArgs),
+
+    /// Recursively scans a games-library folder (same immediate-subfolder
+    /// convention as `scan --root`) and reports every target with an
+    /// integrity problem `repair` could diagnose — read-only, never fixes
+    /// anything itself.
+    Audit(AuditArgs),
 
     /// Dump environment/tooling diagnostics (vendored tools resolution,
     /// DPAPI store reachability, recent log tail, known-target count) for
@@ -145,6 +164,51 @@ pub enum Command {
     /// with) — only the config-generation step `export` already did once is
     /// skipped.
     Import(ImportArgs),
+
+    /// Exports library-wide achievement completion statistics, timestamps,
+    /// and unlock progress across every known-injected target on this
+    /// machine — for external auditing or spreadsheets, not for backup/
+    /// restore (see `backup-achievements`/`restore` for that).
+    #[command(name = "export-achievements")]
+    ExportAchievements(ExportAchievementsArgs),
+
+    /// Parses one RPCS3 trophy set (`TROPCONF.SFM` + `TROPUSR.DAT`) and
+    /// prints the trophy list with live unlock state. Not yet wired into
+    /// `export-achievements` or the GUI achievement viewer — a standalone,
+    /// tested parser first.
+    #[command(hide = true, name = "rpcs3-trophies")]
+    Rpcs3Trophies(Rpcs3TrophiesArgs),
+}
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExportFormat {
+    Csv,
+    Json,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ExportAchievementsArgs {
+    #[arg(long, value_enum)]
+    pub format: ExportFormat,
+
+    /// Write to this file instead of stdout — same flag name as `export`'s
+    /// own output-package flag.
+    #[arg(long)]
+    pub out: Option<PathBuf>,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct Rpcs3TrophiesArgs {
+    /// Folder containing one game's TROPCONF.SFM/TROPUSR.DAT directly (the
+    /// real RPCS3 layout: `<dev_hdd0>/home/<user>/trophy/<trp_name>/`) —
+    /// not RPCS3's install root or its whole trophy/ folder.
+    #[arg(long)]
+    pub path: PathBuf,
+
+    /// Emit a JSON array instead of human-readable lines — same convention
+    /// as `scan --json`.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -175,6 +239,34 @@ pub struct DeployRealGlyphsArgs {
     /// The already-injected game folder (must contain `.gse_manifest.json`).
     #[arg(long)]
     pub path: PathBuf,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ReinjectArgs {
+    /// The already-injected game folder (must contain `.gse_manifest.json`)
+    /// whose steam_api(64).dll a Steam update reverted to vanilla.
+    #[arg(long)]
+    pub path: PathBuf,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct RepairArgs {
+    /// The game folder to diagnose (and, where safely possible, fix).
+    #[arg(long)]
+    pub path: PathBuf,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct AuditArgs {
+    /// Games-library folder whose immediate subfolders are audited, each as
+    /// its own independent target — same convention as `scan --root`.
+    #[arg(long)]
+    pub root: PathBuf,
+
+    /// Emit a JSON array instead of human-readable lines — see `scan
+    /// --json`'s doc comment for the shared rationale.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -279,6 +371,20 @@ pub struct ScanArgs {
     /// its own independent target (e.g. `SteamLibrary\steamapps\common\`).
     #[arg(long)]
     pub root: PathBuf,
+
+    /// Emit a JSON array instead of human-readable lines — the stable,
+    /// scriptable contract external tooling (Phase 11 §11.4's Playnite
+    /// plugin) integrates against instead of parsing console text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct ListArgs {
+    /// Emit a JSON array instead of human-readable lines — see `scan
+    /// --json`'s doc comment for the shared rationale.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -489,6 +595,16 @@ pub struct TargetArgs {
     /// (not an error) when the target isn't SteamStub-protected.
     #[arg(long = "unpack-steamstub")]
     pub unpack_steamstub: bool,
+
+    /// Preview what `inject`/`revert` would do without changing anything in
+    /// the target directory: resolved TOD, DLL arch, App ID, achievement-
+    /// data availability, and (for `inject`) the real file list a full run
+    /// would produce, generated into a scratch temp dir and reported but
+    /// never merged in. Still makes the same network calls a real run would
+    /// (App ID lookup, `generate_emu_config.exe`) — this is an accurate
+    /// preview, not an offline one.
+    #[arg(long = "dry-run")]
+    pub dry_run: bool,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]

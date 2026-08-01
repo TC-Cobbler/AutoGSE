@@ -87,6 +87,21 @@ pub enum AutoGseError {
     #[error("invalid package: {0}")]
     PackageInvalid(String),
 
+    #[error("{0}")]
+    ReinjectNotApplicable(String),
+
+    #[error("{0}")]
+    RepairFailed(String),
+
+    #[error("audit found {0} target(s) with an integrity problem")]
+    AuditFoundProblems(usize),
+
+    #[error("achievement export failed: {0}")]
+    ExportFailed(String),
+
+    #[error("RPCS3 trophy data: {0}")]
+    Rpcs3(String),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 
@@ -128,6 +143,11 @@ impl AutoGseError {
             AutoGseError::Lan(_) => 32,
             AutoGseError::AlreadyInjected(_) => 33,
             AutoGseError::PackageInvalid(_) => 34,
+            AutoGseError::ReinjectNotApplicable(_) => 35,
+            AutoGseError::RepairFailed(_) => 36,
+            AutoGseError::AuditFoundProblems(_) => 37,
+            AutoGseError::ExportFailed(_) => 38,
+            AutoGseError::Rpcs3(_) => 39,
         }
     }
 }

@@ -6,15 +6,17 @@ use windows::Win32::Security::Cryptography::{
     CryptProtectData, CryptUnprotectData, CRYPTPROTECT_UI_FORBIDDEN, CRYPT_INTEGER_BLOB,
 };
 use windows::core::PCWSTR;
+use zeroize::Zeroizing;
 
 use crate::error::AutoGseError;
+use crate::secret::SecretString;
 
 const CREDENTIALS_FILENAME: &str = "credentials.dat";
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct Credentials {
-    pub username: String,
-    pub password: String,
+    pub username: SecretString,
+    pub password: SecretString,
 }
 
 /// `%LOCALAPPDATA%\AutoGSE` — DPAPI itself (not this path) is what actually
@@ -70,7 +72,7 @@ pub(crate) fn dpapi_unprotect(ciphertext: &mut [u8]) -> Result<Vec<u8>, AutoGseE
 
 pub fn save_in(dir: &Path, creds: &Credentials) -> Result<(), AutoGseError> {
     std::fs::create_dir_all(dir)?;
-    let mut plaintext = serde_json::to_vec(creds)?;
+    let mut plaintext = Zeroizing::new(serde_json::to_vec(creds)?);
     let encrypted = dpapi_protect(&mut plaintext)?;
     std::fs::write(credentials_path(dir), encrypted)?;
     Ok(())
@@ -82,7 +84,10 @@ pub fn load_in(dir: &Path) -> Result<Option<Credentials>, AutoGseError> {
         return Ok(None);
     }
     let mut encrypted = std::fs::read(&path)?;
-    let decrypted = dpapi_unprotect(&mut encrypted)?;
+    // Wrapped immediately so the raw plaintext JSON (which contains the
+    // password) is zeroed on drop even if `serde_json::from_slice` below
+    // errors out before a `Credentials` value ever exists to own it.
+    let decrypted = Zeroizing::new(dpapi_unprotect(&mut encrypted)?);
     let creds = serde_json::from_slice(&decrypted)?;
     Ok(Some(creds))
 }
@@ -126,7 +131,7 @@ mod tests {
     use super::*;
 
     fn sample() -> Credentials {
-        Credentials { username: "steam_user".to_string(), password: "hunter2".to_string() }
+        Credentials { username: SecretString::new("steam_user".to_string()), password: SecretString::new("hunter2".to_string()) }
     }
 
     #[test]

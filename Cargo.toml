@@ -1,3 +1,13 @@
+[workspace]
+# Phase 11 §11.1: the root package below stays the workspace's implicit
+# member (Cargo includes it automatically since this manifest has both
+# [package] and [workspace]); `shell-ext` is the only other member — a
+# separate crate because it must build as a `cdylib` real COM server DLL
+# while this crate stays an `rlib` behind the two `[[bin]]`s below, and
+# mixing both crate-types on one Cargo target is an avoidable complication a
+# second workspace member sidesteps entirely.
+members = ["shell-ext"]
+
 [package]
 name = "autogse"
 version = "0.2.0"
@@ -12,32 +22,40 @@ path = "src/lib.rs"
 name = "autogse"
 path = "src/main.rs"
 
-[[bin]]
-name = "autogse-gui"
-path = "src/bin/autogse_gui.rs"
-
 [dependencies]
 anyhow = "1.0.104"
 clap = { version = "4.6.2", features = ["derive"] }
+csv = "1.3.1"
 dunce = "1.0.5"
 md-5 = "0.11.0"
 notify = "8.2.0"
-raw-window-handle = "0.6"
 regex = "1.13.1"
+roxmltree = "0.20.0"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
 serde_yaml = "0.9.34"
 sha2 = "0.11.0"
-slint = { version = "1.17.1", features = ["raw-window-handle-06"] }
 strsim = "0.11.1"
 tempfile = "3.27.0"
 thiserror = "2.0.19"
 ureq = { version = "3.3.0", default-features = false, features = ["native-tls", "gzip", "json"] }
-windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_System_IO", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Console", "UI_Notifications", "Data_Xml_Dom", "Win32_System_WinRT", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Storage_EnhancedStorage", "Win32_System_Ole", "Win32_System_SystemServices", "Win32_Graphics_Gdi", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
+zeroize = { version = "1.9", features = ["derive"] }
+# Phase 0 (Cheevos integration, roadmap-cheevos-integration.md): pruned back
+# to just what the CLI/shell-ext actually use — dropped two GUI-only features
+# (Win32_System_Ole, Win32_System_SystemServices, confirmed used only by the
+# now-removed autogse-gui) and two features confirmed unused anywhere in the
+# codebase (Win32_System_IO, Win32_Graphics_Gdi). NOTE: an initial pass also
+# removed Win32_System_Variant/Win32_NetworkManagement_Ndis on the same
+# "no literal string match in source" basis — wrong: windows-rs gates some
+# functions by a feature from a *different* module than the one the function
+# lives in (StructuredStorage's PropVariant functions require
+# Win32_System_Variant; IpHelper's GetAdaptersAddresses requires
+# Win32_NetworkManagement_Ndis) — a real `cargo build` failure is what caught
+# this, not the grep audit, which can't see transitive feature gates.
+windows = { version = "0.62.2", features = ["Win32_Foundation", "Win32_System_Registry", "Win32_System_Threading", "Win32_Storage_FileSystem", "Win32_System_Diagnostics_ToolHelp", "Win32_UI_Shell", "Win32_UI_WindowsAndMessaging", "Win32_Security", "Win32_Security_Cryptography", "Win32_System_Console", "UI_Notifications", "Data_Xml_Dom", "Win32_System_WinRT", "Win32_System_Com", "Win32_UI_Shell_PropertiesSystem", "Win32_System_Com_StructuredStorage", "Win32_System_Variant", "Win32_Storage_EnhancedStorage", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinSock"] }
 windows-core = "0.62.2"
 
 [build-dependencies]
-slint-build = "1.17.1"
 winres = "0.1.12"
 
 [dev-dependencies]

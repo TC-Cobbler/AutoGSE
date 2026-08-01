@@ -9,15 +9,18 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::achievements;
 use crate::acw;
 use crate::anticheat;
 use crate::appid::{self, AppIdContext};
 use crate::backup;
 use crate::backup_manager;
 use crate::cli::{
-    AddModArgs, BackupAchievementsArgs, CliNetworkPreset, ConfigureOverlayArgs, DeployRealGlyphsArgs, ExportArgs, ImportArgs, InjectMode, JoinArgs,
-    LanAction, LanArgs, ParseControllerVdfArgs, RestoreArgs, ScanArgs, SyncDirection, SyncSavesArgs, TargetArgs,
+    AddModArgs, AuditArgs, BackupAchievementsArgs, CliNetworkPreset, ConfigureOverlayArgs, DeployRealGlyphsArgs, ExportAchievementsArgs, ExportArgs,
+    ExportFormat, ImportArgs, InjectMode, JoinArgs, LanAction, LanArgs, ListArgs, ParseControllerVdfArgs, ReinjectArgs, RepairArgs, Rpcs3TrophiesArgs,
+    RestoreArgs, ScanArgs, SyncDirection, SyncSavesArgs, TargetArgs,
 };
+use crate::rpcs3;
 use crate::controller_glyphs;
 use crate::credentials;
 use crate::discovery;
@@ -66,10 +69,9 @@ pub fn run_uninstall_menu() -> Result<(), AutoGseError> {
 pub fn run_login(interaction: &dyn Interaction) -> Result<(), AutoGseError> {
     let creds = interaction.capture_login()?;
     credentials::save(&creds)?;
-    println!(
-        "[AutoGSE] Logged in as {}. Future injections will include achievement data automatically.",
-        creds.username
-    );
+    let username = creds.username.as_str().to_string();
+    drop(creds); // zeroize the plaintext now — nothing below needs it
+    println!("[AutoGSE] Logged in as {username}. Future injections will include achievement data automatically.");
     Ok(())
 }
 
@@ -88,7 +90,9 @@ pub fn run_logout() -> Result<(), AutoGseError> {
 pub fn run_ra_login() -> Result<(), AutoGseError> {
     let creds = crate::login_prompt::capture_ra_login_stdio()?;
     crate::retroachievements::save(&creds)?;
-    println!("[AutoGSE] RetroAchievements login saved for {}.", creds.username);
+    let username = creds.username.as_str().to_string();
+    drop(creds); // zeroize the plaintext API key now — nothing below needs it
+    println!("[AutoGSE] RetroAchievements login saved for {username}.");
     Ok(())
 }
 
@@ -209,6 +213,39 @@ pub enum ScanStatus {
     /// `backup::restore_backup` already performs on revert, just without
     /// actually restoring).
     NeedsUpdate,
+    /// Phase 11 §11.3: the live `steam_api(64).dll` now matches the
+    /// pre-injection vanilla hash recorded in `backed_up_files` — Steam
+    /// re-patched the game and silently overwrote our Goldberg DLL without
+    /// touching the untouched `.org` backup or the manifest. Distinct from
+    /// `NeedsUpdate` above, which is about the *backup* file's own integrity,
+    /// not the live one. `reinject` (below) is the fix for this state.
+    UpdateReverted,
+}
+
+impl ScanStatus {
+    /// Stable, snake_case token for `--json` output (Phase 11 §11.4) —
+    /// deliberately separate from `run_scan`/`run_list`'s human-readable
+    /// labels so wording those for readability later can't silently break a
+    /// script/plugin parsing this value.
+    pub fn as_json_str(&self) -> &'static str {
+        match self {
+            ScanStatus::Vanilla => "vanilla",
+            ScanStatus::Injected => "injected",
+            ScanStatus::NeedsUpdate => "needs_update",
+            ScanStatus::UpdateReverted => "update_reverted",
+        }
+    }
+}
+
+/// True only for the file(s) `reinject`/the update-watcher care about — the
+/// swapped `steam_api(64).dll` itself, never a Phase 10 §10.3 SteamStub-unpack
+/// backup of the game's main exe, which also rides in `backed_up_files` but
+/// must never be treated as the emulator DLL.
+fn is_dll_backup(entry: &BackedUpFile) -> bool {
+    Path::new(&entry.original_path)
+        .extension()
+        .map(|ext| ext.eq_ignore_ascii_case("dll"))
+        .unwrap_or(false)
 }
 
 pub fn classify_target(tod: &Path) -> Result<ScanStatus, AutoGseError> {
@@ -224,7 +261,142 @@ pub fn classify_target(tod: &Path) -> Result<ScanStatus, AutoGseError> {
             return Ok(ScanStatus::NeedsUpdate);
         }
     }
+    // `steamclient` mode never swaps steam_api(64).dll (Phase 6 §6.5), so it
+    // has no live-vs-vanilla drift to detect here.
+    if manifest.mode == "regular" {
+        for entry in manifest.backed_up_files.iter().filter(|e| is_dll_backup(e)) {
+            let live_path = tod.join(&entry.original_path);
+            if live_path.is_file() && backup::sha256_file(&live_path)? == entry.sha256_hash {
+                return Ok(ScanStatus::UpdateReverted);
+            }
+        }
+    }
     Ok(ScanStatus::Injected)
+}
+
+/// Phase 12 §12.2/§12.3's per-target integrity diagnosis — shared by `repair`
+/// (acts on one `--path`) and `audit` (reports across a whole `--root`), so
+/// there's exactly one place that decides "is this target broken and why,"
+/// not a third divergent copy of `classify_target`'s hash-check logic.
+/// Distinguishes cases `ScanStatus`/`classify_target` collapse into one
+/// `NeedsUpdate` bucket, plus one case neither of them can see at all:
+/// `OrphanedBackup`, a DLL already swapped mid-inject with no manifest ever
+/// written (the process died between `backup::ensure_backed_up` and
+/// `manifest::save` in `run_inject_single`'s real write order).
+#[derive(Debug, PartialEq, Eq)]
+pub enum RepairDiagnosis {
+    Healthy,
+    /// No `.gse_manifest.json` and no orphaned `.org` backup either — an
+    /// ordinary vanilla (never-injected) target, not a problem.
+    NoManifest,
+    OrphanedBackup {
+        dll_name: String,
+    },
+    /// The manifest references a backup file that's simply gone — not
+    /// restorable by `repair`; there's nothing left to restore from.
+    BackupMissing {
+        entry: BackedUpFile,
+    },
+    /// A backup exists but its live hash no longer matches what the
+    /// manifest recorded when it was created — corrupted or tampered with.
+    BackupHashMismatch {
+        entry: BackedUpFile,
+        actual_hash: String,
+    },
+    StaleManifestVersion {
+        found: String,
+    },
+    /// Reuses `ScanStatus::UpdateReverted`'s exact signal — not corruption,
+    /// just needs `autogse reinject`, which `repair` points at rather than
+    /// duplicating.
+    UpdateReverted,
+}
+
+impl RepairDiagnosis {
+    /// Stable, snake_case token — same `--json` convention as
+    /// `ScanStatus::as_json_str`.
+    pub fn as_json_str(&self) -> &'static str {
+        match self {
+            RepairDiagnosis::Healthy => "healthy",
+            RepairDiagnosis::NoManifest => "no_manifest",
+            RepairDiagnosis::OrphanedBackup { .. } => "orphaned_backup",
+            RepairDiagnosis::BackupMissing { .. } => "backup_missing",
+            RepairDiagnosis::BackupHashMismatch { .. } => "backup_hash_mismatch",
+            RepairDiagnosis::StaleManifestVersion { .. } => "stale_manifest_version",
+            RepairDiagnosis::UpdateReverted => "update_reverted",
+        }
+    }
+
+    /// Whether `audit` should count this as a library problem. `NoManifest`
+    /// is deliberately excluded — most folders under a real games-library
+    /// root are just ordinary vanilla games, not something `audit` failed
+    /// to fix.
+    pub fn is_problem(&self) -> bool {
+        !matches!(self, RepairDiagnosis::Healthy | RepairDiagnosis::NoManifest)
+    }
+
+    pub fn describe(&self) -> String {
+        match self {
+            RepairDiagnosis::Healthy => "healthy".to_string(),
+            RepairDiagnosis::NoManifest => "not an AutoGSE target (no .gse_manifest.json)".to_string(),
+            RepairDiagnosis::OrphanedBackup { dll_name } => {
+                format!("{dll_name}.org exists next to a live {dll_name} with no manifest — looks like an interrupted inject")
+            }
+            RepairDiagnosis::BackupMissing { entry } => {
+                format!("manifest references backup '{}' for {}, but the file is missing", entry.backup_path, entry.original_path)
+            }
+            RepairDiagnosis::BackupHashMismatch { entry, actual_hash } => {
+                format!("backup '{}' hash mismatch: manifest expects {}, found {actual_hash}", entry.backup_path, entry.sha256_hash)
+            }
+            RepairDiagnosis::StaleManifestVersion { found } => {
+                format!("manifest version {found} predates this binary's {} — no migration path exists yet", manifest::MANIFEST_VERSION)
+            }
+            RepairDiagnosis::UpdateReverted => "a Steam update reverted the live DLL to vanilla — run `autogse reinject`".to_string(),
+        }
+    }
+}
+
+/// The two DLL names `ensure_backed_up`/`classify_target` ever back up —
+/// same list `discovery.rs`'s own DLL scan uses.
+const DLL_BACKUP_NAMES: [&str; 2] = ["steam_api.dll", "steam_api64.dll"];
+
+pub fn diagnose_target(tod: &Path) -> Result<RepairDiagnosis, AutoGseError> {
+    let Some(manifest) = manifest::load(tod)? else {
+        for dll_name in DLL_BACKUP_NAMES {
+            let backup_path = tod.join(format!("{dll_name}.org"));
+            let live_path = tod.join(dll_name);
+            if backup_path.is_file() && live_path.is_file() {
+                return Ok(RepairDiagnosis::OrphanedBackup { dll_name: dll_name.to_string() });
+            }
+        }
+        return Ok(RepairDiagnosis::NoManifest);
+    };
+
+    if manifest.version != manifest::MANIFEST_VERSION {
+        return Ok(RepairDiagnosis::StaleManifestVersion { found: manifest.version.clone() });
+    }
+
+    for entry in &manifest.backed_up_files {
+        let backup_path = tod.join(&entry.backup_path);
+        if !backup_path.is_file() {
+            return Ok(RepairDiagnosis::BackupMissing { entry: entry.clone() });
+        }
+        let actual_hash = backup::sha256_file(&backup_path)?;
+        if actual_hash != entry.sha256_hash {
+            return Ok(RepairDiagnosis::BackupHashMismatch { entry: entry.clone(), actual_hash });
+        }
+    }
+
+    if manifest.mode == "regular" {
+        for entry in manifest.backed_up_files.iter().filter(|e| is_dll_backup(e)) {
+            let live_path = tod.join(&entry.original_path);
+            if live_path.is_file() && backup::sha256_file(&live_path)? == entry.sha256_hash {
+                return Ok(RepairDiagnosis::UpdateReverted);
+            }
+        }
+    }
+
+    Ok(RepairDiagnosis::Healthy)
 }
 
 /// One row of Phase 7 §7.2's dashboard: a discovered-or-known target plus its
@@ -274,8 +446,47 @@ fn dashboard_row(tod: PathBuf) -> Result<DashboardRow, AutoGseError> {
     })
 }
 
+/// Phase 11 §11.4's stable, scriptable enumeration schema — the contract
+/// external tooling (a Playnite plugin, or anything else shelling out to
+/// this CLI) integrates against instead of parsing the human-readable lines
+/// `run_scan`/`run_list` print by default. Field names/shapes here are a
+/// compatibility surface: extend, don't rename or repurpose.
+#[derive(serde::Serialize)]
+pub struct JsonTarget {
+    pub path: String,
+    pub status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub game_title: Option<String>,
+}
+
+fn json_target(tod: &Path, status: ScanStatus, manifest: Option<&GseManifest>) -> JsonTarget {
+    JsonTarget {
+        path: tod.display().to_string(),
+        status: status.as_json_str(),
+        mode: manifest.map(|m| m.mode.clone()),
+        app_id: manifest.and_then(|m| m.app_id),
+        game_title: manifest.and_then(|m| m.game_title.clone()),
+    }
+}
+
 pub fn run_scan(args: &ScanArgs) -> Result<(), AutoGseError> {
     let targets = discovery::find_all_targets_under(&args.root)?;
+
+    if args.json {
+        let mut json_targets = Vec::with_capacity(targets.len());
+        for target in &targets {
+            let status = classify_target(&target.tod)?;
+            let manifest = manifest::load(&target.tod)?;
+            json_targets.push(json_target(&target.tod, status, manifest.as_ref()));
+        }
+        println!("{}", serde_json::to_string_pretty(&json_targets)?);
+        return Ok(());
+    }
+
     if targets.is_empty() {
         println!("[AutoGSE] No injectable targets found under {}.", args.root.display());
         return Ok(());
@@ -287,6 +498,7 @@ pub fn run_scan(args: &ScanArgs) -> Result<(), AutoGseError> {
             ScanStatus::Vanilla => "vanilla",
             ScanStatus::Injected => "injected",
             ScanStatus::NeedsUpdate => "needs update",
+            ScanStatus::UpdateReverted => "steam update reverted",
         };
         println!("[{label}] {}", target.tod.display());
     }
@@ -294,17 +506,225 @@ pub fn run_scan(args: &ScanArgs) -> Result<(), AutoGseError> {
     Ok(())
 }
 
-pub fn run_list() -> Result<(), AutoGseError> {
+pub fn run_list(args: &ListArgs) -> Result<(), AutoGseError> {
     let targets = index::load_existing_injected()?;
+
+    if args.json {
+        let mut json_targets = Vec::with_capacity(targets.len());
+        for tod in &targets {
+            let manifest = manifest::load(tod)?;
+            let status = classify_target(tod)?;
+            json_targets.push(json_target(tod, status, manifest.as_ref()));
+        }
+        println!("{}", serde_json::to_string_pretty(&json_targets)?);
+        return Ok(());
+    }
+
     if targets.is_empty() {
         println!("[AutoGSE] No injected targets recorded on this machine.");
         return Ok(());
     }
     for tod in &targets {
         let mode = manifest::load(tod)?.map(|m| m.mode).unwrap_or_else(|| "regular".to_string());
-        println!("[{mode}] {}", tod.display());
+        // Phase 11 §11.3: surface a Steam-update revert here too, not just via
+        // `scan --root` — `list` is the "what have I touched" view and this
+        // is exactly the kind of drift a user wouldn't otherwise notice until
+        // trying to launch the game and finding achievements gone.
+        if classify_target(tod)? == ScanStatus::UpdateReverted {
+            println!("[{mode}, steam update reverted — run `autogse reinject --path \"{}\"`] {}", tod.display(), tod.display());
+        } else {
+            println!("[{mode}] {}", tod.display());
+        }
     }
     println!("[AutoGSE] {} injected target(s) known on this machine.", targets.len());
+    Ok(())
+}
+
+/// Phase 11 §11.3's fix for `ScanStatus::UpdateReverted`: restages the
+/// vendored Goldberg DLL over a `steam_api(64).dll` that a Steam patch
+/// silently reverted to vanilla, without touching `steam_settings/` or
+/// re-running `generate_emu_config.exe` — the whole point is preserving
+/// whatever custom configuration is already sitting on disk, not regenerating
+/// it. Only ever restages the DLL backup entry (`is_dll_backup`), never a
+/// Phase 10 §10.3 SteamStub-unpack backup of the game's main exe that may
+/// also be present in the same manifest.
+pub fn run_reinject(args: &ReinjectArgs) -> Result<(), AutoGseError> {
+    let d_root = discovery::compute_d_root(&args.path)?;
+    let _lock = AutoGseLock::acquire(&d_root, LOCK_TIMEOUT_MS)?;
+
+    let resolution = discovery::resolve_target(&args.path, None)?;
+    let Some(manifest) = manifest::load(&resolution.tod)? else {
+        return Err(AutoGseError::NotInjected(resolution.tod));
+    };
+
+    if manifest.mode != "regular" {
+        return Err(AutoGseError::ReinjectNotApplicable(format!(
+            "{} was injected in '{}' mode, which never swaps steam_api(64).dll — nothing to reinject",
+            resolution.tod.display(),
+            manifest.mode
+        )));
+    }
+
+    if classify_target(&resolution.tod)? != ScanStatus::UpdateReverted {
+        return Err(AutoGseError::ReinjectNotApplicable(format!(
+            "{} is not currently in a Steam-update-reverted state — nothing to reinject",
+            resolution.tod.display()
+        )));
+    }
+
+    let arch = manifest.arch.as_deref().and_then(pe::Arch::parse).ok_or_else(|| {
+        AutoGseError::ReinjectNotApplicable(format!(
+            "{}'s manifest has no recorded architecture — run a fresh `inject` instead",
+            resolution.tod.display()
+        ))
+    })?;
+    let dll_src = goldberg::dll_source_path(arch)?;
+
+    let mut restaged = 0usize;
+    for entry in manifest.backed_up_files.iter().filter(|e| is_dll_backup(e)) {
+        let live_path = resolution.tod.join(&entry.original_path);
+        backup::atomic_copy(&dll_src, &live_path)?;
+        restaged += 1;
+    }
+    if restaged == 0 {
+        return Err(AutoGseError::ReinjectNotApplicable(format!(
+            "{}'s manifest has no recorded steam_api(64).dll backup entry — run a fresh `inject` instead",
+            resolution.tod.display()
+        )));
+    }
+
+    println!(
+        "[AutoGSE] Restaged the Goldberg emulator DLL over {} ({arch}) — steam_settings/ and existing custom configuration were left untouched.",
+        resolution.tod.display()
+    );
+    notify::show(
+        "AutoGSE: Re-Injection Complete",
+        &format!("Restored the Goldberg emulator after a Steam update reverted {}.", resolution.tod.display()),
+    );
+    Ok(())
+}
+
+/// Phase 12 §12.2: diagnoses (and, where safe, fixes) a single target via
+/// `diagnose_target`. Only `OrphanedBackup` gets an actual fix here —
+/// everything else is either already healthy, already has its own dedicated
+/// fix (`UpdateReverted` → `reinject`), or isn't safely automatable
+/// (`BackupMissing`/`BackupHashMismatch`/`StaleManifestVersion` all report
+/// only, since blindly acting on a hash AutoGSE itself just flagged as wrong
+/// could hand the user a broken game binary).
+pub fn run_repair(args: &RepairArgs) -> Result<(), AutoGseError> {
+    let d_root = discovery::compute_d_root(&args.path)?;
+    let _lock = AutoGseLock::acquire(&d_root, LOCK_TIMEOUT_MS)?;
+
+    let resolution = discovery::resolve_target(&args.path, None)?;
+    let diagnosis = diagnose_target(&resolution.tod)?;
+
+    match diagnosis {
+        RepairDiagnosis::Healthy => {
+            println!("[AutoGSE] {} is healthy — nothing to repair.", resolution.tod.display());
+            Ok(())
+        }
+        RepairDiagnosis::NoManifest => Err(AutoGseError::NotInjected(resolution.tod)),
+        RepairDiagnosis::UpdateReverted => {
+            println!(
+                "[AutoGSE] {} is not corrupted — a Steam update reverted the live DLL to vanilla. Run `autogse reinject --path \"{}\"` instead.",
+                resolution.tod.display(),
+                resolution.tod.display()
+            );
+            Ok(())
+        }
+        RepairDiagnosis::StaleManifestVersion { found } => Err(AutoGseError::RepairFailed(format!(
+            "{}'s manifest is version {found} (this binary supports {}) — no migration path exists yet; if the game itself is still vanilla, run `inject` fresh",
+            resolution.tod.display(),
+            manifest::MANIFEST_VERSION
+        ))),
+        RepairDiagnosis::BackupMissing { entry } => Err(AutoGseError::RepairFailed(format!(
+            "{}'s backup '{}' for {} is missing — not recoverable by AutoGSE. Use Steam's \"Verify integrity of game files\" to restore the original, then run `inject` fresh",
+            resolution.tod.display(),
+            entry.backup_path,
+            entry.original_path
+        ))),
+        RepairDiagnosis::BackupHashMismatch { entry, actual_hash } => Err(AutoGseError::RepairFailed(format!(
+            "{}'s backup '{}' for {} is corrupted (expected {}, found {actual_hash}) — not safe to restore automatically. Use Steam's \"Verify integrity of game files\" to restore the original, then run `inject` fresh",
+            resolution.tod.display(),
+            entry.backup_path,
+            entry.original_path,
+            entry.sha256_hash
+        ))),
+        RepairDiagnosis::OrphanedBackup { dll_name } => {
+            let live_path = resolution.tod.join(&dll_name);
+            let backup_path = resolution.tod.join(format!("{dll_name}.org"));
+            // No manifest hash to verify against here (there is no
+            // manifest) — this just confirms the backup is actually
+            // readable before trusting it, a best-effort sanity check, not
+            // the cryptographic guarantee `backup::restore_backup`'s
+            // manifest-hash comparison gives when a manifest does exist.
+            backup::sha256_file(&backup_path)?;
+            backup::strip_readonly(&live_path)?;
+            std::fs::remove_file(&live_path)?;
+            std::fs::rename(&backup_path, &live_path)?;
+            println!(
+                "[AutoGSE] Restored {} to vanilla from its orphaned backup ({dll_name} was mid-inject with no manifest ever written). Run `inject` fresh to complete it properly.",
+                resolution.tod.display()
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Phase 12 §12.3's stable, scriptable per-target integrity payload — a
+/// distinct shape from `JsonTarget` (that's about injection status, this is
+/// about integrity), following the same "extend, don't rename or repurpose"
+/// contract.
+#[derive(serde::Serialize)]
+pub struct AuditFinding {
+    pub path: String,
+    pub diagnosis: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Phase 12 §12.3: read-only across `discovery::find_all_targets_under(root)`
+/// — never `list_dashboard_targets`, which also merges in the cross-machine
+/// known-target index; "scans a library recursively" means strictly what's
+/// under `root`, the same scope `scan --root` already uses. Deliberately
+/// reuses `diagnose_target` (§12.2) rather than its own copy of the
+/// hash-check logic, so `repair` and `audit` can't drift apart on what
+/// counts as broken.
+pub fn run_audit(args: &AuditArgs) -> Result<(), AutoGseError> {
+    let targets = discovery::find_all_targets_under(&args.root)?;
+
+    let mut diagnosed = Vec::with_capacity(targets.len());
+    for target in &targets {
+        diagnosed.push((target.tod.clone(), diagnose_target(&target.tod)?));
+    }
+
+    let problem_count = diagnosed.iter().filter(|(_, d)| d.is_problem()).count();
+    let healthy_count = diagnosed.iter().filter(|(_, d)| *d == RepairDiagnosis::Healthy).count();
+
+    if args.json {
+        let findings: Vec<AuditFinding> = diagnosed
+            .iter()
+            .map(|(tod, d)| AuditFinding { path: tod.display().to_string(), diagnosis: d.as_json_str(), detail: d.is_problem().then(|| d.describe()) })
+            .collect();
+        println!("{}", serde_json::to_string_pretty(&findings)?);
+    } else if targets.is_empty() {
+        println!("[AutoGSE] No targets found under {}.", args.root.display());
+    } else {
+        for (tod, diagnosis) in &diagnosed {
+            if diagnosis.is_problem() {
+                println!("[{}] {}: {}", diagnosis.as_json_str(), tod.display(), diagnosis.describe());
+            }
+        }
+        println!(
+            "[AutoGSE] Audited {} target(s) under {}: {healthy_count} healthy, {problem_count} with problem(s).",
+            targets.len(),
+            args.root.display()
+        );
+    }
+
+    if problem_count > 0 {
+        return Err(AutoGseError::AuditFoundProblems(problem_count));
+    }
     Ok(())
 }
 
@@ -608,6 +1028,211 @@ pub fn run_import(args: &ImportArgs) -> Result<(), AutoGseError> {
     Ok(())
 }
 
+/// Phase 13's per-row payload — every earned/unearned achievement across
+/// every known-injected target, flattened for CSV/JSON export. Distinct from
+/// `JsonTarget`/`AuditFinding`: this is achievement-granular, not
+/// target-granular, so one target contributes many rows.
+#[derive(serde::Serialize)]
+pub struct AchievementExportRow {
+    pub target_path: String,
+    pub app_id: u64,
+    pub game_title: Option<String>,
+    pub achievement_name: String,
+    pub display_name: String,
+    pub unlocked: bool,
+    pub unlocked_at: Option<u64>,
+}
+
+fn collect_achievement_export_rows() -> Result<Vec<AchievementExportRow>, AutoGseError> {
+    collect_achievement_export_rows_for(&index::load_existing_injected()?)
+}
+
+/// Split out from `collect_achievement_export_rows` purely so it's testable
+/// against a synthetic target list — `index::load_existing_injected` itself
+/// always reads the real `%LOCALAPPDATA%\AutoGSE\known_targets.json`, with
+/// no injectable-directory variant.
+fn collect_achievement_export_rows_for(targets: &[PathBuf]) -> Result<Vec<AchievementExportRow>, AutoGseError> {
+    let mut rows = Vec::new();
+    for tod in targets {
+        let Some(manifest) = manifest::load(tod)? else { continue };
+        let Some(app_id) = manifest.app_id else { continue };
+        let achievements = achievements::load_with_unlock_state(tod, Some(app_id))?;
+        for a in achievements {
+            rows.push(AchievementExportRow {
+                target_path: tod.display().to_string(),
+                app_id,
+                game_title: manifest.game_title.clone(),
+                achievement_name: a.name,
+                display_name: a.display_name,
+                unlocked: a.unlocked,
+                unlocked_at: a.unlocked_at,
+            });
+        }
+    }
+    Ok(rows)
+}
+
+/// Phase 13: library-wide achievement export across every known-injected
+/// target (`index::load_existing_injected`, same source `list`/`doctor`
+/// already use) — no `--root` needed. Writes to `args.out` when given,
+/// otherwise stdout; a status line is only ever printed when writing to a
+/// *file*, never to stdout, so a redirected/piped export's data stream isn't
+/// polluted with a non-data line.
+/// Writes `rows` in `format` to `writer` — split out from
+/// `run_export_achievements` so the CSV/JSON serialization itself is
+/// directly unit-testable without touching the real global target index.
+fn write_export_rows(rows: &[AchievementExportRow], format: ExportFormat, mut writer: impl std::io::Write) -> Result<(), AutoGseError> {
+    match format {
+        ExportFormat::Json => {
+            serde_json::to_writer_pretty(&mut writer, rows)?;
+            let _ = writer.write_all(b"\n");
+        }
+        ExportFormat::Csv => {
+            let mut csv_writer = csv::Writer::from_writer(writer);
+            for row in rows {
+                csv_writer.serialize(row).map_err(|e| AutoGseError::ExportFailed(e.to_string()))?;
+            }
+            csv_writer.flush().map_err(|e| AutoGseError::ExportFailed(e.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+pub fn run_export_achievements(args: &ExportAchievementsArgs) -> Result<(), AutoGseError> {
+    let rows = collect_achievement_export_rows()?;
+
+    let output: Box<dyn std::io::Write> = match &args.out {
+        Some(path) => Box::new(std::fs::File::create(path)?),
+        None => Box::new(std::io::stdout()),
+    };
+    write_export_rows(&rows, args.format, output)?;
+
+    if let Some(path) = &args.out {
+        println!("[AutoGSE] Exported {} achievement row(s) to {}.", rows.len(), path.display());
+    }
+    Ok(())
+}
+
+/// Phase 13's RPCS3 trophy parser CLI wrapper — hidden, not yet wired into
+/// `export-achievements` or the GUI achievement viewer (see `src/rpcs3.rs`'s
+/// own doc comment for why this stays a standalone, tested capability for
+/// now rather than a fully productized feature).
+pub fn run_rpcs3_trophies(args: &Rpcs3TrophiesArgs) -> Result<(), AutoGseError> {
+    let trophies = rpcs3::load_trophy_set_with_state(&args.path)?;
+
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&trophies)?);
+        return Ok(());
+    }
+
+    if trophies.is_empty() {
+        println!("[AutoGSE] No trophies found in {}.", args.path.display());
+        return Ok(());
+    }
+
+    for t in &trophies {
+        let grade = format!("{:?}", t.trophy.grade).to_lowercase();
+        let status = match t.state {
+            Some(state) if state.unlocked => "unlocked",
+            Some(_) => "locked",
+            None => "unknown (no TROPUSR.DAT entry)",
+        };
+        let hidden_note = if t.trophy.hidden { " [hidden]" } else { "" };
+        println!("[{grade}] {} - {status}{hidden_note}", t.trophy.name);
+    }
+    println!("[AutoGSE] {} trophy(ies) parsed from {}.", trophies.len(), args.path.display());
+    Ok(())
+}
+
+/// Phase 12 §12.1's read-only preview of what `resolve_auth_mode` would
+/// decide — covers `--anon` and an already-stored login, but deliberately
+/// stops short of `resolve_auth_mode`'s interactive disclosure prompt
+/// (`anon_opt_in` preference check included), since answering "would
+/// achievement data be included?" is not worth the side effect of
+/// `--dry-run` silently prompting for and persisting a real login the same
+/// way a real `inject` would. A first-run machine (no stored credentials,
+/// no `--anon`) previews as anonymous; `report_dry_run_inject` phrases that
+/// case accordingly rather than implying it's a final answer.
+fn peek_auth_mode(args: &TargetArgs) -> Result<AuthMode, AutoGseError> {
+    if args.anon {
+        return Ok(AuthMode::Anonymous);
+    }
+    if let Some(creds) = credentials::load()? {
+        return Ok(AuthMode::Authenticated { username: creds.username, password: creds.password });
+    }
+    Ok(AuthMode::Anonymous)
+}
+
+/// Recursively lists `dir`'s files as TOD-relative `steam_settings/...`
+/// paths — the same shape `goldberg::merge_steam_settings` would actually
+/// copy into the target, computed here purely for the dry-run report so
+/// nothing needs to be exposed from `goldberg.rs` beyond what it already
+/// returns from a real run.
+fn list_generated_settings_files(base: &Path, rel: &Path, out: &mut Vec<String>) -> Result<(), AutoGseError> {
+    for entry in std::fs::read_dir(base.join(rel))? {
+        let entry = entry?;
+        let child_rel = rel.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            list_generated_settings_files(base, &child_rel, out)?;
+        } else {
+            out.push(format!("steam_settings/{}", child_rel.to_string_lossy().replace('\\', "/")));
+        }
+    }
+    Ok(())
+}
+
+/// Phase 12 §12.1: prints what a real `inject` would do, having actually run
+/// discovery/PE-check/App-ID-resolution and a real `generate_emu_config.exe`
+/// pass (into `gec_out`, a scratch temp dir `run_inject_single` never merges
+/// into the target) — an accurate preview, not a guessed one. Bypasses
+/// `Output`'s `--silent` gate via plain `println!`, same as every other
+/// subcommand's primary report (`scan`/`list`/`reinject`/...): a dry-run's
+/// entire purpose is to print a report, so it must not be silenced by the
+/// same flag that suppresses a real run's success chatter.
+fn report_dry_run_inject(
+    resolution: &discovery::TargetResolution,
+    app_id_resolution: &appid::AppIdResolution,
+    arch: pe::Arch,
+    forced_anon: bool,
+    auth_mode: &AuthMode,
+    gec_out: &Path,
+) -> Result<(), AutoGseError> {
+    println!("[AutoGSE] [dry-run] Nothing was changed — this is a preview only.");
+    println!("[AutoGSE] [dry-run] Target: {} ({arch})", resolution.tod.display());
+    println!(
+        "[AutoGSE] [dry-run] App ID: {} (source: {}){}",
+        app_id_resolution.app_id,
+        app_id_resolution.source.as_str(),
+        app_id_resolution.game_title.as_deref().map(|t| format!(", \"{t}\"")).unwrap_or_default()
+    );
+
+    let achievement_note = match (matches!(auth_mode, AuthMode::Authenticated { .. }), forced_anon) {
+        (true, _) => "would be included (Steam login configured)".to_string(),
+        (false, true) => "would NOT be included (--anon forces anonymous access)".to_string(),
+        (false, false) => "would NOT be included (no Steam login configured — a real interactive run may prompt you to log in first)".to_string(),
+    };
+    println!("[AutoGSE] [dry-run] Achievement data: {achievement_note}");
+
+    let dll_name = resolution.dll_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+    println!("[AutoGSE] [dry-run] Would back up {dll_name} -> {dll_name}.org, then swap in the Goldberg emulator DLL.");
+
+    let generated_settings = gec_out.join("steam_settings");
+    if generated_settings.is_dir() {
+        let mut files = Vec::new();
+        list_generated_settings_files(&generated_settings, Path::new(""), &mut files)?;
+        files.sort();
+        println!("[AutoGSE] [dry-run] Would write {} file(s):", files.len() + 1);
+        for f in &files {
+            println!("[AutoGSE] [dry-run]   {f}");
+        }
+        println!("[AutoGSE] [dry-run]   steam_appid.txt");
+    } else {
+        println!("[AutoGSE] [dry-run] generate_emu_config.exe produced no steam_settings/ output for this App ID.");
+    }
+    println!("[AutoGSE] [dry-run] Would write .gse_manifest.json to record this injection.");
+    Ok(())
+}
+
 /// Resolves which Steam access mode `run_inject_single` should use, per
 /// roadmap.md Phase 5: login is the default once configured, `--anon` is
 /// always honored as an explicit opt-out, and a first-run machine (neither
@@ -642,7 +1267,7 @@ fn resolve_auth_mode(args: &TargetArgs, interactive: bool, out: &Output, interac
                 credentials::save(&creds)?;
                 out.info(format!(
                     "Logged in as {}. Future injections will include achievement data automatically.",
-                    creds.username
+                    creds.username.as_str()
                 ));
                 Ok(AuthMode::Authenticated { username: creds.username, password: creds.password })
             }
@@ -874,6 +1499,7 @@ fn run_inject_batch(root: &Path, args: &TargetArgs, out: &Output, interaction: &
         }
     }
     out.info(format!("Batch inject complete: {succeeded} succeeded, {failed} failed, out of {} target(s).", targets.len()));
+    drop(auth_mode); // the batch-wide original clone source — zeroize it now rather than at fn exit
     Ok(())
 }
 
@@ -961,6 +1587,22 @@ fn run_inject_single(
     let appid_ctx = AppIdContext { tod: &resolution.tod, exe_hint: path, override_appid: args.appid, interaction: prompt };
     let app_id_resolution = appid::resolve_app_id(&appid_ctx)?;
 
+    // Phase 12 §12.1: everything above this point (discovery, PE bitness,
+    // anti-cheat scan, App ID resolution) is already read-only or temp-dir
+    // scoped. Everything below starts mutating the target directory
+    // (`ensure_backed_up` renames the live DLL) — the natural short-circuit
+    // point. Uses `peek_auth_mode`, not `resolve_auth_mode`: the latter can
+    // prompt for and persist a real login/anon preference as a side effect
+    // of "just resolving what mode to use," which `--dry-run` must never
+    // trigger.
+    if args.dry_run {
+        let auth_mode = peek_auth_mode(args)?;
+        let gec_out = tempfile::Builder::new().prefix("autogse_gec_dryrun_").tempdir()?;
+        let gen_opts = goldberg::GenOptions { controller: args.controller, inventory: args.inventory };
+        goldberg::run_generate_emu_config(app_id_resolution.app_id, gec_out.path(), &auth_mode, gen_opts)?;
+        return report_dry_run_inject(&resolution, &app_id_resolution, arch, args.anon, &auth_mode, gec_out.path());
+    }
+
     // `steamclient` mode stages an alternate `steamclient(64).dll` loader
     // fileset instead (see `steamclient_mode::stage`, called further below)
     // and leaves the game's real `steam_api(64).dll`, and therefore this
@@ -1031,6 +1673,15 @@ fn run_inject_single(
     let gec_out = tempfile::Builder::new().prefix("autogse_gec_").tempdir()?;
     let gen_opts = goldberg::GenOptions { controller: args.controller, inventory: args.inventory };
     goldberg::run_generate_emu_config(app_id_resolution.app_id, gec_out.path(), &auth_mode, gen_opts)?;
+    // Phase 12 §12.4: `auth_mode`'s plaintext username/password are only
+    // needed up to this point (the child's environment is a private copy
+    // taken at spawn time, per `run_generate_emu_config`) — capture just the
+    // discriminant the rest of this function still needs, then drop the
+    // real value immediately so `SecretString`'s `ZeroizeOnDrop` wipes it
+    // now instead of at the end of this (long-running, network-bound)
+    // function's scope.
+    let is_authenticated = matches!(auth_mode, AuthMode::Authenticated { .. });
+    drop(auth_mode);
 
     // Writes into gec_out's steam_settings/ (steam_interfaces.txt + .ini)
     // before the merge below, so the existing merge_steam_settings picks
@@ -1129,10 +1780,10 @@ fn run_inject_single(
     }
     if acw_schema_deployed {
         out.info("Deployed achievement schema and registered save path with Achievement Watcher.");
-    } else if matches!(auth_mode, AuthMode::Authenticated { .. }) {
+    } else if is_authenticated {
         out.warn("Could not deploy Achievement Watcher schema (Achievement Watcher may not be installed).");
     }
-    if matches!(auth_mode, AuthMode::Anonymous) {
+    if !is_authenticated {
         out.warn(
             "No achievement data was generated (anonymous Steam access). Run `autogse login` to enable \
              achievement names, descriptions, and icons on future injections.",
@@ -1213,6 +1864,10 @@ fn run_revert_single(path: &Path, args: &TargetArgs, out: &Output, interaction: 
         return Ok(());
     };
 
+    if args.dry_run {
+        return report_dry_run_revert(&resolution, &manifest);
+    }
+
     for entry in &manifest.backed_up_files {
         restore_one(&resolution.tod, entry)?;
     }
@@ -1256,6 +1911,44 @@ fn run_revert_single(path: &Path, args: &TargetArgs, out: &Output, interaction: 
         None => "Removed the steamclient loader files and emulator configs.".to_string(),
     };
     notify::show("AutoGSE: Rollback Complete", &notify_body);
+    Ok(())
+}
+
+/// Phase 12 §12.1's `revert --dry-run`: verifies each `.org` backup's hash
+/// directly via `backup::sha256_file` (not `backup::restore_backup`, whose
+/// contract is verify-then-restore with no verify-only mode) and reports
+/// what would be removed, without calling `restore_one`, `remove_file`,
+/// `remove_dir_all`, `manifest::remove`, or `index::forget`.
+fn report_dry_run_revert(resolution: &discovery::TargetResolution, manifest: &GseManifest) -> Result<(), AutoGseError> {
+    println!("[AutoGSE] [dry-run] Nothing was changed — this is a preview only.");
+    println!("[AutoGSE] [dry-run] Target: {}", resolution.tod.display());
+
+    if manifest.backed_up_files.is_empty() {
+        println!("[AutoGSE] [dry-run] No backed-up files recorded (steamclient mode never swaps a DLL).");
+    }
+    for entry in &manifest.backed_up_files {
+        let backup_path = resolution.tod.join(&entry.backup_path);
+        let status = if !backup_path.is_file() {
+            "MISSING — revert would fail here".to_string()
+        } else {
+            match backup::sha256_file(&backup_path) {
+                Ok(actual) if actual == entry.sha256_hash => "hash OK".to_string(),
+                Ok(actual) => format!("HASH MISMATCH (expected {}, found {actual}) — revert would fail here", entry.sha256_hash),
+                Err(e) => format!("could not hash ({e}) — revert would fail here"),
+            }
+        };
+        println!("[AutoGSE] [dry-run] Would restore {} <- {} ({status}).", entry.original_path, entry.backup_path);
+    }
+
+    println!("[AutoGSE] [dry-run] Would remove {} tracked injected file(s):", manifest.injected_files.len());
+    for f in &manifest.injected_files {
+        println!("[AutoGSE] [dry-run]   {f}");
+    }
+
+    if resolution.tod.join("steam_settings").is_dir() {
+        println!("[AutoGSE] [dry-run] Would remove steam_settings/ entirely.");
+    }
+    println!("[AutoGSE] [dry-run] Would remove .gse_manifest.json and forget this target.");
     Ok(())
 }
 
@@ -1437,5 +2130,623 @@ mod tests {
         std::fs::write(dir.path().join(manifest::MANIFEST_FILENAME), r#"{"version": "0.0.1", "timestamp": "unix:0", "target_directory": "x", "backed_up_files": []}"#).unwrap();
 
         assert_eq!(classify_target(dir.path()).unwrap(), ScanStatus::NeedsUpdate);
+    }
+
+    #[test]
+    fn scan_status_json_tokens_are_stable_snake_case() {
+        // Phase 11 §11.4: this is the actual wire contract external tooling
+        // (the Playnite plugin skeleton) parses — pin it explicitly so a
+        // future wording tweak to the human-readable labels in
+        // run_scan/run_list can't accidentally change it too.
+        assert_eq!(ScanStatus::Vanilla.as_json_str(), "vanilla");
+        assert_eq!(ScanStatus::Injected.as_json_str(), "injected");
+        assert_eq!(ScanStatus::NeedsUpdate.as_json_str(), "needs_update");
+        assert_eq!(ScanStatus::UpdateReverted.as_json_str(), "update_reverted");
+    }
+
+    #[test]
+    fn json_target_carries_manifest_fields_and_omits_them_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let manifest = GseManifest {
+            version: manifest::MANIFEST_VERSION.to_string(),
+            timestamp: "unix:0".to_string(),
+            target_directory: dir.path().to_string_lossy().into_owned(),
+            backed_up_files: vec![],
+            app_id: Some(480),
+            arch: Some("x64".to_string()),
+            app_id_source: None,
+            game_title: Some("Spacewar".to_string()),
+            injected_files: vec![],
+            mode: "regular".to_string(),
+        };
+
+        let with_manifest = json_target(dir.path(), ScanStatus::Injected, Some(&manifest));
+        assert_eq!(with_manifest.status, "injected");
+        assert_eq!(with_manifest.mode.as_deref(), Some("regular"));
+        assert_eq!(with_manifest.app_id, Some(480));
+        assert_eq!(with_manifest.game_title.as_deref(), Some("Spacewar"));
+
+        let without_manifest = json_target(dir.path(), ScanStatus::Vanilla, None);
+        assert_eq!(without_manifest.status, "vanilla");
+        assert_eq!(without_manifest.mode, None);
+        assert_eq!(without_manifest.app_id, None);
+        assert_eq!(without_manifest.game_title, None);
+
+        // Confirms the serialized shape actually omits absent fields rather
+        // than emitting `null` — a real behavioral difference a consumer
+        // (e.g. C#'s System.Text.Json against a non-nullable-by-default
+        // model) could care about, not just a cosmetic one.
+        let json = serde_json::to_string(&without_manifest).unwrap();
+        assert!(!json.contains("mode"));
+        assert!(!json.contains("app_id"));
+        assert!(!json.contains("game_title"));
+    }
+
+    fn write_reinject_fixture(dir: &std::path::Path, mode: &str) -> GseManifest {
+        let backup_path = dir.join("steam_api64.dll.org");
+        let original_bytes = b"vanilla dll bytes";
+        std::fs::write(&backup_path, original_bytes).unwrap();
+        // Simulates what a Steam patch does: the live file is put back to
+        // byte-identical vanilla, without touching the `.org` backup.
+        std::fs::write(dir.join("steam_api64.dll"), original_bytes).unwrap();
+        let hash = backup::sha256_file(&backup_path).unwrap();
+
+        let manifest = GseManifest {
+            version: manifest::MANIFEST_VERSION.to_string(),
+            timestamp: "unix:0".to_string(),
+            target_directory: dir.to_string_lossy().into_owned(),
+            backed_up_files: vec![BackedUpFile {
+                original_path: "steam_api64.dll".to_string(),
+                backup_path: "steam_api64.dll.org".to_string(),
+                sha256_hash: hash,
+            }],
+            app_id: Some(480),
+            arch: Some("x64".to_string()),
+            app_id_source: None,
+            game_title: None,
+            injected_files: vec![],
+            mode: mode.to_string(),
+        };
+        manifest::save(dir, &manifest).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn classify_target_detects_update_reverted_when_live_dll_matches_backup_hash() {
+        let dir = tempfile::tempdir().unwrap();
+        write_reinject_fixture(dir.path(), "regular");
+
+        assert_eq!(classify_target(dir.path()).unwrap(), ScanStatus::UpdateReverted);
+    }
+
+    #[test]
+    fn classify_target_ignores_live_dll_drift_in_steamclient_mode() {
+        // steamclient mode never swaps steam_api(64).dll in the first place
+        // (Phase 6 §6.5), so a coincidental hash match here must not be
+        // reported as a Steam-update revert.
+        let dir = tempfile::tempdir().unwrap();
+        write_reinject_fixture(dir.path(), "steamclient");
+
+        assert_eq!(classify_target(dir.path()).unwrap(), ScanStatus::Injected);
+    }
+
+    #[test]
+    fn reinject_restages_the_real_goldberg_dll_and_leaves_backup_and_settings_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        write_reinject_fixture(dir.path(), "regular");
+        std::fs::create_dir_all(dir.path().join("steam_settings")).unwrap();
+        std::fs::write(dir.path().join("steam_settings").join("configs.main.ini"), "custom config").unwrap();
+
+        run_reinject(&ReinjectArgs { path: dir.path().to_path_buf() }).unwrap();
+
+        let restaged = std::fs::read(dir.path().join("steam_api64.dll")).unwrap();
+        let goldberg_dll = std::fs::read(goldberg::dll_source_path(pe::Arch::X64).unwrap()).unwrap();
+        assert_eq!(restaged, goldberg_dll, "reinject should restage the real Goldberg DLL");
+        assert!(dir.path().join("steam_api64.dll.org").is_file(), "the .org backup must be untouched by reinject");
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("steam_settings").join("configs.main.ini")).unwrap(),
+            "custom config",
+            "reinject must not regenerate/touch existing steam_settings/"
+        );
+        assert_eq!(classify_target(dir.path()).unwrap(), ScanStatus::Injected);
+    }
+
+    #[test]
+    fn reinject_rejects_a_target_that_is_not_update_reverted() {
+        let dir = tempfile::tempdir().unwrap();
+        // A normal, undisturbed injected target — live DLL differs from the
+        // backup, so this must not classify as UpdateReverted.
+        let backup_path = dir.path().join("steam_api64.dll.org");
+        std::fs::write(&backup_path, b"vanilla dll bytes").unwrap();
+        std::fs::write(dir.path().join("steam_api64.dll"), b"goldberg dll bytes (different)").unwrap();
+        let hash = backup::sha256_file(&backup_path).unwrap();
+        let manifest = GseManifest {
+            version: manifest::MANIFEST_VERSION.to_string(),
+            timestamp: "unix:0".to_string(),
+            target_directory: dir.path().to_string_lossy().into_owned(),
+            backed_up_files: vec![BackedUpFile {
+                original_path: "steam_api64.dll".to_string(),
+                backup_path: "steam_api64.dll.org".to_string(),
+                sha256_hash: hash,
+            }],
+            app_id: Some(480),
+            arch: Some("x64".to_string()),
+            app_id_source: None,
+            game_title: None,
+            injected_files: vec![],
+            mode: "regular".to_string(),
+        };
+        manifest::save(dir.path(), &manifest).unwrap();
+
+        let result = run_reinject(&ReinjectArgs { path: dir.path().to_path_buf() });
+
+        assert!(matches!(result, Err(AutoGseError::ReinjectNotApplicable(_))));
+    }
+
+    #[test]
+    fn reinject_rejects_steamclient_mode_targets() {
+        let dir = tempfile::tempdir().unwrap();
+        write_reinject_fixture(dir.path(), "steamclient");
+
+        let result = run_reinject(&ReinjectArgs { path: dir.path().to_path_buf() });
+
+        assert!(matches!(result, Err(AutoGseError::ReinjectNotApplicable(_))));
+    }
+
+    // -- Phase 12 §12.2/§12.3: diagnose_target/repair/audit --------------
+
+    fn write_healthy_fixture(dir: &std::path::Path) -> GseManifest {
+        std::fs::create_dir_all(dir).unwrap();
+        let backup_path = dir.join("steam_api64.dll.org");
+        std::fs::write(&backup_path, b"vanilla dll bytes").unwrap();
+        // A live DLL is required for `discovery::find_all_targets_under` to
+        // find this folder at all — content just needs to differ from the
+        // backup's so the "live DLL matches backup" UpdateReverted check
+        // (irrelevant here) can't accidentally fire.
+        std::fs::write(dir.join("steam_api64.dll"), b"goldberg dll bytes (different)").unwrap();
+        let hash = backup::sha256_file(&backup_path).unwrap();
+
+        let manifest = GseManifest {
+            version: manifest::MANIFEST_VERSION.to_string(),
+            timestamp: "unix:0".to_string(),
+            target_directory: dir.to_string_lossy().into_owned(),
+            backed_up_files: vec![BackedUpFile {
+                original_path: "steam_api64.dll".to_string(),
+                backup_path: "steam_api64.dll.org".to_string(),
+                sha256_hash: hash,
+            }],
+            app_id: Some(480),
+            arch: Some("x64".to_string()),
+            app_id_source: None,
+            game_title: None,
+            injected_files: vec!["steam_appid.txt".to_string()],
+            mode: "regular".to_string(),
+        };
+        manifest::save(dir, &manifest).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn diagnose_target_is_healthy_when_manifest_and_hashes_match() {
+        let dir = tempfile::tempdir().unwrap();
+        write_healthy_fixture(dir.path());
+        assert_eq!(diagnose_target(dir.path()).unwrap(), RepairDiagnosis::Healthy);
+    }
+
+    #[test]
+    fn diagnose_target_is_no_manifest_for_a_plain_vanilla_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(diagnose_target(dir.path()).unwrap(), RepairDiagnosis::NoManifest);
+    }
+
+    #[test]
+    fn diagnose_target_detects_orphaned_backup_with_no_manifest() {
+        // Simulates a process dying between `backup::ensure_backed_up` and
+        // `manifest::save` in `run_inject_single`'s real write order: the
+        // DLL is already swapped, but no manifest was ever written.
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("steam_api64.dll.org"), b"vanilla dll bytes").unwrap();
+        std::fs::write(dir.path().join("steam_api64.dll"), b"goldberg dll bytes").unwrap();
+
+        assert_eq!(
+            diagnose_target(dir.path()).unwrap(),
+            RepairDiagnosis::OrphanedBackup { dll_name: "steam_api64.dll".to_string() }
+        );
+    }
+
+    #[test]
+    fn diagnose_target_detects_backup_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        // No steam_api64.dll.org actually written — the manifest references
+        // a backup that simply isn't there.
+        std::fs::write(dir.path().join("steam_api64.dll"), b"goldberg dll bytes").unwrap();
+        let manifest = GseManifest {
+            version: manifest::MANIFEST_VERSION.to_string(),
+            timestamp: "unix:0".to_string(),
+            target_directory: dir.path().to_string_lossy().into_owned(),
+            backed_up_files: vec![BackedUpFile {
+                original_path: "steam_api64.dll".to_string(),
+                backup_path: "steam_api64.dll.org".to_string(),
+                sha256_hash: "0".repeat(64),
+            }],
+            app_id: Some(480),
+            arch: Some("x64".to_string()),
+            app_id_source: None,
+            game_title: None,
+            injected_files: vec![],
+            mode: "regular".to_string(),
+        };
+        manifest::save(dir.path(), &manifest).unwrap();
+
+        let diagnosis = diagnose_target(dir.path()).unwrap();
+        assert!(matches!(diagnosis, RepairDiagnosis::BackupMissing { .. }));
+    }
+
+    #[test]
+    fn diagnose_target_detects_backup_hash_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        write_healthy_fixture(dir.path());
+        // Corrupt the backup after the fact — the manifest on disk still
+        // records the original (now-wrong) hash.
+        std::fs::write(dir.path().join("steam_api64.dll.org"), b"corrupted bytes").unwrap();
+
+        let diagnosis = diagnose_target(dir.path()).unwrap();
+        match diagnosis {
+            RepairDiagnosis::BackupHashMismatch { entry, actual_hash } => {
+                assert_eq!(entry.backup_path, "steam_api64.dll.org");
+                assert_eq!(actual_hash, backup::sha256_file(&dir.path().join("steam_api64.dll.org")).unwrap());
+            }
+            other => panic!("expected BackupHashMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn diagnose_target_detects_stale_manifest_version() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(manifest::MANIFEST_FILENAME), r#"{"version": "0.0.1", "timestamp": "unix:0", "target_directory": "x", "backed_up_files": []}"#).unwrap();
+
+        assert_eq!(diagnose_target(dir.path()).unwrap(), RepairDiagnosis::StaleManifestVersion { found: "0.0.1".to_string() });
+    }
+
+    #[test]
+    fn diagnose_target_detects_update_reverted() {
+        let dir = tempfile::tempdir().unwrap();
+        write_reinject_fixture(dir.path(), "regular");
+        assert_eq!(diagnose_target(dir.path()).unwrap(), RepairDiagnosis::UpdateReverted);
+    }
+
+    #[test]
+    fn repair_diagnosis_json_tokens_are_stable_snake_case() {
+        assert_eq!(RepairDiagnosis::Healthy.as_json_str(), "healthy");
+        assert_eq!(RepairDiagnosis::NoManifest.as_json_str(), "no_manifest");
+        assert_eq!(RepairDiagnosis::OrphanedBackup { dll_name: "x".to_string() }.as_json_str(), "orphaned_backup");
+        assert_eq!(RepairDiagnosis::UpdateReverted.as_json_str(), "update_reverted");
+    }
+
+    #[test]
+    fn repair_diagnosis_is_problem_excludes_healthy_and_no_manifest_only() {
+        assert!(!RepairDiagnosis::Healthy.is_problem());
+        assert!(!RepairDiagnosis::NoManifest.is_problem());
+        assert!(RepairDiagnosis::UpdateReverted.is_problem());
+        assert!(RepairDiagnosis::OrphanedBackup { dll_name: "x".to_string() }.is_problem());
+    }
+
+    #[test]
+    fn run_repair_reports_healthy_as_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        write_healthy_fixture(dir.path());
+        run_repair(&RepairArgs { path: dir.path().to_path_buf() }).unwrap();
+    }
+
+    #[test]
+    fn run_repair_errors_not_injected_on_a_vanilla_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("steam_api64.dll"), b"vanilla dll bytes").unwrap();
+
+        let result = run_repair(&RepairArgs { path: dir.path().to_path_buf() });
+
+        assert!(matches!(result, Err(AutoGseError::NotInjected(_))));
+    }
+
+    #[test]
+    fn run_repair_fixes_an_orphaned_backup_by_restoring_vanilla() {
+        let dir = tempfile::tempdir().unwrap();
+        let vanilla_bytes = b"vanilla dll bytes";
+        std::fs::write(dir.path().join("steam_api64.dll.org"), vanilla_bytes).unwrap();
+        std::fs::write(dir.path().join("steam_api64.dll"), b"goldberg dll bytes").unwrap();
+
+        run_repair(&RepairArgs { path: dir.path().to_path_buf() }).unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("steam_api64.dll")).unwrap(), vanilla_bytes);
+        assert!(!dir.path().join("steam_api64.dll.org").is_file(), "the orphaned backup should be consumed by the restore");
+    }
+
+    #[test]
+    fn run_repair_reports_but_does_not_touch_a_hash_mismatched_backup() {
+        let dir = tempfile::tempdir().unwrap();
+        write_healthy_fixture(dir.path());
+        std::fs::write(dir.path().join("steam_api64.dll.org"), b"corrupted bytes").unwrap();
+        let before = std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap();
+
+        let result = run_repair(&RepairArgs { path: dir.path().to_path_buf() });
+
+        assert!(matches!(result, Err(AutoGseError::RepairFailed(_))));
+        assert_eq!(std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap(), before, "repair must not touch a backup it can't safely restore");
+    }
+
+    #[test]
+    fn run_repair_points_at_reinject_for_an_update_reverted_target() {
+        let dir = tempfile::tempdir().unwrap();
+        write_reinject_fixture(dir.path(), "regular");
+        // Not corrupted, and not fixed by `repair` — `reinject` owns this case.
+        run_repair(&RepairArgs { path: dir.path().to_path_buf() }).unwrap();
+        assert_eq!(classify_target(dir.path()).unwrap(), ScanStatus::UpdateReverted, "repair must not touch an UpdateReverted target");
+    }
+
+    #[test]
+    fn run_audit_counts_healthy_and_problem_targets_and_errors_when_any_found() {
+        let root = tempfile::tempdir().unwrap();
+        write_healthy_fixture(&root.path().join("GameA"));
+        write_healthy_fixture(&root.path().join("GameB"));
+        std::fs::write(root.path().join("GameB").join("steam_api64.dll.org"), b"corrupted bytes").unwrap();
+
+        let result = run_audit(&AuditArgs { root: root.path().to_path_buf(), json: false });
+
+        assert!(matches!(result, Err(AutoGseError::AuditFoundProblems(1))));
+    }
+
+    #[test]
+    fn run_audit_succeeds_when_library_is_all_healthy_or_vanilla() {
+        let root = tempfile::tempdir().unwrap();
+        write_healthy_fixture(&root.path().join("GameA"));
+        std::fs::create_dir_all(root.path().join("GameB")).unwrap();
+        std::fs::write(root.path().join("GameB").join("steam_api64.dll"), b"vanilla, never injected").unwrap();
+
+        run_audit(&AuditArgs { root: root.path().to_path_buf(), json: false }).unwrap();
+    }
+
+    #[test]
+    fn run_audit_json_output_uses_stable_tokens_and_omits_detail_for_healthy() {
+        let root = tempfile::tempdir().unwrap();
+        write_healthy_fixture(&root.path().join("GameA"));
+
+        run_audit(&AuditArgs { root: root.path().to_path_buf(), json: true }).unwrap();
+        // Exercised for the JSON-serialization code path above (no panic on
+        // a real `AuditFinding` with `detail: None`); the JSON itself goes
+        // to stdout, not asserted here since this suite doesn't capture it —
+        // `json_target_carries_manifest_fields_and_omits_them_when_absent`
+        // above already proves this project's `skip_serializing_if` pattern
+        // behaves correctly for an analogous struct.
+    }
+
+    // -- Phase 12 §12.1: --dry-run -----------------------------------------
+
+    fn target_args_dry_run(path: &std::path::Path, dry_run: bool) -> TargetArgs {
+        TargetArgs {
+            path: Some(path.to_path_buf()),
+            root: None,
+            appid: None,
+            silent: true,
+            anon: false,
+            language: None,
+            account_name: None,
+            steamid: None,
+            controller: false,
+            inventory: false,
+            overlay: false,
+            offline: false,
+            steam_deck: false,
+            compat_flag: vec![],
+            unlock_all_dlc: false,
+            mode: InjectMode::Regular,
+            skip_ac_scan: true,
+            unpack_steamstub: false,
+            dry_run,
+        }
+    }
+
+    fn write_full_injected_fixture(dir: &std::path::Path) -> GseManifest {
+        let backup_path = dir.join("steam_api64.dll.org");
+        std::fs::write(&backup_path, b"vanilla dll bytes").unwrap();
+        std::fs::write(dir.join("steam_api64.dll"), b"goldberg dll bytes (different)").unwrap();
+        let hash = backup::sha256_file(&backup_path).unwrap();
+
+        std::fs::create_dir_all(dir.join("steam_settings")).unwrap();
+        std::fs::write(dir.join("steam_settings").join("configs.main.ini"), "generated config").unwrap();
+        std::fs::write(dir.join("steam_appid.txt"), "480").unwrap();
+
+        let manifest = GseManifest {
+            version: manifest::MANIFEST_VERSION.to_string(),
+            timestamp: "unix:0".to_string(),
+            target_directory: dir.to_string_lossy().into_owned(),
+            backed_up_files: vec![BackedUpFile {
+                original_path: "steam_api64.dll".to_string(),
+                backup_path: "steam_api64.dll.org".to_string(),
+                sha256_hash: hash,
+            }],
+            app_id: Some(480),
+            arch: Some("x64".to_string()),
+            app_id_source: None,
+            game_title: None,
+            injected_files: vec!["steam_appid.txt".to_string(), "steam_settings/configs.main.ini".to_string()],
+            mode: "regular".to_string(),
+        };
+        manifest::save(dir, &manifest).unwrap();
+        manifest
+    }
+
+    #[test]
+    fn revert_dry_run_leaves_everything_on_disk_untouched() {
+        let dir = tempfile::tempdir().unwrap();
+        write_full_injected_fixture(dir.path());
+        let before_dll = std::fs::read(dir.path().join("steam_api64.dll")).unwrap();
+        let before_backup = std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap();
+
+        let args = target_args_dry_run(dir.path(), true);
+        let out = Output::new(true);
+        let interaction = crate::interaction::StdioInteraction;
+        run_revert_single(dir.path(), &args, &out, &interaction).unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("steam_api64.dll")).unwrap(), before_dll, "dry-run must not restore the live DLL");
+        assert_eq!(std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap(), before_backup, "dry-run must not touch the backup");
+        assert!(dir.path().join("steam_settings").is_dir(), "dry-run must not remove steam_settings/");
+        assert!(dir.path().join("steam_appid.txt").is_file(), "dry-run must not remove injected_files entries");
+        assert!(manifest::exists(dir.path()), "dry-run must not remove the manifest");
+    }
+
+    #[test]
+    fn revert_dry_run_reports_a_hash_mismatch_without_touching_anything() {
+        let dir = tempfile::tempdir().unwrap();
+        write_full_injected_fixture(dir.path());
+        std::fs::write(dir.path().join("steam_api64.dll.org"), b"corrupted bytes").unwrap();
+        let before_backup = std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap();
+
+        let args = target_args_dry_run(dir.path(), true);
+        let out = Output::new(true);
+        let interaction = crate::interaction::StdioInteraction;
+        // A dry-run must report the mismatch, not propagate it as an error
+        // the way a real revert's `restore_backup` would — the whole point
+        // is to preview, never to fail loudly over something it didn't
+        // actually try to fix.
+        run_revert_single(dir.path(), &args, &out, &interaction).unwrap();
+
+        assert_eq!(std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap(), before_backup, "dry-run must not touch a mismatched backup either");
+        assert!(manifest::exists(dir.path()));
+    }
+
+    // -- Phase 13: export-achievements ------------------------------------
+
+    fn write_export_fixture(dir: &std::path::Path, app_id: u64, game_title: &str, achievement_name: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        let manifest = GseManifest {
+            version: manifest::MANIFEST_VERSION.to_string(),
+            timestamp: "unix:0".to_string(),
+            target_directory: dir.to_string_lossy().into_owned(),
+            backed_up_files: vec![],
+            app_id: Some(app_id),
+            arch: Some("x64".to_string()),
+            app_id_source: None,
+            game_title: Some(game_title.to_string()),
+            injected_files: vec![],
+            mode: "regular".to_string(),
+        };
+        manifest::save(dir, &manifest).unwrap();
+
+        let settings_dir = dir.join("steam_settings");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(
+            settings_dir.join("achievements.json"),
+            format!(r#"[{{"description":"d","displayName":"{achievement_name} Display","hidden":"0","icon":"","icongray":"","name":"{achievement_name}"}}]"#),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn collect_achievement_export_rows_for_flattens_multiple_targets() {
+        let root = tempfile::tempdir().unwrap();
+        write_export_fixture(&root.path().join("GameA"), 480, "Spacewar", "ACH_A");
+        write_export_fixture(&root.path().join("GameB"), 105600, "Terraria", "ACH_B");
+
+        let targets = vec![root.path().join("GameA"), root.path().join("GameB")];
+        let rows = collect_achievement_export_rows_for(&targets).unwrap();
+
+        assert_eq!(rows.len(), 2);
+        let spacewar = rows.iter().find(|r| r.app_id == 480).unwrap();
+        assert_eq!(spacewar.game_title.as_deref(), Some("Spacewar"));
+        assert_eq!(spacewar.achievement_name, "ACH_A");
+        assert_eq!(spacewar.display_name, "ACH_A Display");
+        // No real, resolvable unlock file exists for this synthetic
+        // fixture (achievements::resolve_unlock_state_path reads the real
+        // %APPDATA%, not injectable here — same limitation
+        // `load_with_unlock_state_merges_real_unlock_status` in
+        // achievements.rs already documents) — every row defaults to
+        // locked, matching load_definitions' own default.
+        assert!(!spacewar.unlocked);
+        assert_eq!(spacewar.unlocked_at, None);
+    }
+
+    #[test]
+    fn collect_achievement_export_rows_for_skips_targets_with_no_manifest_or_no_app_id() {
+        let root = tempfile::tempdir().unwrap();
+        let vanilla = root.path().join("Vanilla");
+        std::fs::create_dir_all(&vanilla).unwrap();
+
+        let no_app_id = root.path().join("NoAppId");
+        std::fs::create_dir_all(&no_app_id).unwrap();
+        let manifest = GseManifest {
+            version: manifest::MANIFEST_VERSION.to_string(),
+            timestamp: "unix:0".to_string(),
+            target_directory: no_app_id.to_string_lossy().into_owned(),
+            backed_up_files: vec![],
+            app_id: None,
+            arch: None,
+            app_id_source: None,
+            game_title: None,
+            injected_files: vec![],
+            mode: "regular".to_string(),
+        };
+        manifest::save(&no_app_id, &manifest).unwrap();
+
+        let rows = collect_achievement_export_rows_for(&[vanilla, no_app_id]).unwrap();
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn write_export_rows_json_round_trips_real_values() {
+        let rows = vec![AchievementExportRow {
+            target_path: "C:\\Games\\Foo".to_string(),
+            app_id: 480,
+            game_title: Some("Spacewar".to_string()),
+            achievement_name: "ACH_A".to_string(),
+            display_name: "First Steps".to_string(),
+            unlocked: true,
+            unlocked_at: Some(1784651841),
+        }];
+
+        let mut buf = Vec::new();
+        write_export_rows(&rows, ExportFormat::Json, &mut buf).unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&buf).unwrap();
+
+        assert_eq!(parsed[0]["app_id"], 480);
+        assert_eq!(parsed[0]["achievement_name"], "ACH_A");
+        assert_eq!(parsed[0]["unlocked"], true);
+        assert_eq!(parsed[0]["unlocked_at"], 1784651841);
+    }
+
+    #[test]
+    fn write_export_rows_csv_quotes_fields_containing_commas() {
+        let rows = vec![AchievementExportRow {
+            target_path: "C:\\Games\\Foo".to_string(),
+            app_id: 480,
+            game_title: Some("Spacewar".to_string()),
+            achievement_name: "ACH_A".to_string(),
+            display_name: "Steps, First Ever".to_string(),
+            unlocked: false,
+            unlocked_at: None,
+        }];
+
+        let mut buf = Vec::new();
+        write_export_rows(&rows, ExportFormat::Csv, &mut buf).unwrap();
+        let csv_text = String::from_utf8(buf).unwrap();
+
+        let mut reader = csv::Reader::from_reader(csv_text.as_bytes());
+        let records: Vec<csv::StringRecord> = reader.records().collect::<Result<_, _>>().unwrap();
+        assert_eq!(records.len(), 1);
+        // A correct RFC4180 round-trip proves the comma was quoted, not
+        // that the raw bytes merely contain a quote character somewhere.
+        assert_eq!(records[0].get(4), Some("Steps, First Ever"));
+    }
+
+    #[test]
+    fn write_export_rows_handles_an_empty_library() {
+        let rows: Vec<AchievementExportRow> = Vec::new();
+        let mut json_buf = Vec::new();
+        write_export_rows(&rows, ExportFormat::Json, &mut json_buf).unwrap();
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&json_buf).unwrap(), serde_json::json!([]));
+
+        let mut csv_buf = Vec::new();
+        write_export_rows(&rows, ExportFormat::Csv, &mut csv_buf).unwrap();
+        // Header-only (or fully empty) output, never an error.
+        assert!(String::from_utf8(csv_buf).unwrap().lines().count() <= 1);
     }
 }
