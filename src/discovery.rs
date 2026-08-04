@@ -44,9 +44,30 @@ pub fn compute_d_root(path: &Path) -> Result<PathBuf, AutoGseError> {
 /// fallback prompt (Phase 7 §7.0): `None` behaves exactly like the old
 /// `interactive: false` (never prompts, falls straight to `DllNotFound`).
 pub fn resolve_target(path: &Path, interaction: Option<&dyn Interaction>) -> Result<TargetResolution, AutoGseError> {
+    // Real bug found live: a real game (The Binding of Isaac: Rebirth) ships
+    // its actual `isaac-ng.exe` and real `steam_api.dll` at the root, but
+    // also bundles an unrelated helper tool (`tools\ModUploader\`) with its
+    // own separate `steam_api.dll` deeper in the tree. `pick_best`'s pure
+    // "deepest wins" rule (needed for the opposite, equally real UE4/5
+    // pattern — decoy launcher at root, real DLL buried deep, no root DLL
+    // at all) picked the bundled tool's copy instead — wrong, and not just
+    // by heuristic: Windows' own DLL search order loads a DLL from the same
+    // directory as the launched executable first, so when the caller points
+    // at a *specific* .exe and a DLL sits right beside it, that is
+    // unambiguously the one the running game will actually load, regardless
+    // of what else exists deeper in the tree. Checked first, before depth
+    // is even considered; falls through to the unchanged depth-based logic
+    // below whenever `path` is a folder (no specific exe named) or no exact
+    // match happens to sit beside the given file.
     let d_root = compute_d_root(path)?;
 
     let (exact, near) = scan(&d_root);
+
+    if path.is_file() {
+        if let Some(beside) = exact.iter().find(|m| m.path.parent() == Some(d_root.as_path())) {
+            return Ok(to_resolution(beside, &d_root));
+        }
+    }
 
     if let Some(best) = pick_best(&exact) {
         return Ok(to_resolution(&best, &d_root));
@@ -236,6 +257,44 @@ mod tests {
         let resolution = resolve_target(&dir.path().join("Launcher.exe"), None).unwrap();
 
         assert_eq!(resolution.tod, dir.path().join("bin/x64"));
+    }
+
+    #[test]
+    fn dll_beside_a_specifically_given_exe_wins_over_a_deeper_bundled_tool_copy() {
+        // Real bug, found live against a real game (The Binding of Isaac:
+        // Rebirth): a bundled helper tool (`tools/ModUploader/`) ships its
+        // own separate steam_api.dll deeper than the real one at the root,
+        // beside the actual game exe. The opposite depth relationship from
+        // `deepest_match_wins_over_decoy` below — same shape of conflict,
+        // opposite correct answer, which is exactly why this needs a
+        // real specific-exe signal rather than depth alone.
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("isaac-ng.exe"));
+        touch(&dir.path().join("steam_api.dll")); // real, beside the given exe, depth 0
+        touch(&dir.path().join("tools/ModUploader/steam_api.dll")); // decoy bundled tool, depth 2
+
+        let resolution = resolve_target(&dir.path().join("isaac-ng.exe"), None).unwrap();
+
+        assert_eq!(resolution.tod, dir.path());
+        assert_eq!(resolution.depth, 0);
+    }
+
+    #[test]
+    fn folder_only_input_still_prefers_the_deepest_match_even_with_a_root_dll() {
+        // The fix above only applies when the caller names a specific exe.
+        // Given just the folder (no specific exe known), the original
+        // deepest-wins behavior must still stand — this is the exact
+        // scenario `deepest_match_wins_over_decoy` below already covers,
+        // duplicated here under a name that makes the folder-vs-file
+        // distinction explicit, so a future change to one doesn't
+        // accidentally regress the other without a renamed test failing too.
+        let dir = TempDir::new().unwrap();
+        touch(&dir.path().join("steam_api64.dll"));
+        touch(&dir.path().join("Engine/Binaries/Win64/steam_api64.dll"));
+
+        let resolution = resolve_target(dir.path(), None).unwrap();
+
+        assert_eq!(resolution.tod, dir.path().join("Engine/Binaries/Win64"));
     }
 
     #[test]

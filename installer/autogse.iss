@@ -1,5 +1,5 @@
 #define MyAppName "AutoGSE"
-#define MyAppVersion "0.2.0"
+#define MyAppVersion "1.0.0"
 #define MyAppPublisher "AutoGSE Project"
 #define MyAppExeName "autogse.exe"
 

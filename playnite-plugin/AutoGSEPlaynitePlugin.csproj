@@ -22,6 +22,20 @@
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
   </ItemGroup>
 
+  <!--
+    Real, missing-until-this-build reference: IPlayniteAPI.Dialogs.ShowMessage
+    returns System.Windows.MessageBoxResult (PresentationFramework, WPF) —
+    only surfaced once this project was actually built with `dotnet build`
+    for the first time (CS0012). net462 SDK-style projects don't pull WPF
+    framework assemblies in automatically the way `<UseWPF>` does for
+    net6.0-windows+ targets; they need an explicit Reference.
+  -->
+  <ItemGroup>
+    <Reference Include="PresentationFramework" />
+    <Reference Include="PresentationCore" />
+    <Reference Include="WindowsBase" />
+  </ItemGroup>
+
   <ItemGroup>
     <None Include="extension.yaml" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>

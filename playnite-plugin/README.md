@@ -1,12 +1,20 @@
-# AutoGSE Playnite Plugin (skeleton)
+# AutoGSE Playnite Plugin
 
 Phase 11 §11.4. A thin Playnite `GenericPlugin` that shells out to the real
-`autogse.exe` CLI — it does not reimplement any injection logic. This is a
-scaffold, not a polished/store-submitted extension: structurally complete and
-compiles against the PlayniteSDK, but only genuinely proven correct once
-built and loaded into a real running Playnite install against a real game
-library (see `roadmap.md`'s Phase 11 notes for why that verification is
-flagged, not assumed done).
+`autogse.exe` CLI — it does not reimplement any injection logic. Not a
+polished/store-submitted extension, but past the "skeleton" stage: it builds
+clean (`dotnet build -c Release`, 0 warnings/0 errors) and has been live-
+loaded into a real running Playnite install with a real game library —
+confirmed via `playnite.log`'s own `ExtensionFactory:Loaded plugin: AutoGSE
+Integration, version 0.1.0` line, not just assumed from a successful compile.
+See `roadmap.md`'s Phase 11 §11.4 for the full verification history,
+including two real environment bugs found and fixed only by actually
+building this (a cleared NuGet package-source list, and a missing WPF
+`PresentationFramework` reference `MessageBoxResult` needs). The one thing
+still not verified is the actual per-game context-menu click-through (right-
+click a real game, confirm all four menu items appear and work) — that needs
+real mouse interaction inside the Playnite window, not something automatable
+from here.
 
 ## What it does
 
@@ -49,9 +57,9 @@ The plugin resolves `autogse.exe` via the `AUTOGSE_EXE` environment
 variable if set, otherwise assumes it's on `PATH`. AutoGSE's own installer
 does not add itself to `PATH` (Phase 4 §4.2 registers Explorer context-menu
 verbs, not a PATH entry), so most users will need to set `AUTOGSE_EXE` to
-their real install location — this is a real, documented limitation of the
-skeleton, not an oversight; a settings UI for picking the path is a natural
-fast-follow, not built here.
+their real install location — this is a real, documented limitation, not an
+oversight; a settings UI for picking the path is a natural fast-follow, not
+built here.
 
 ## Contract this depends on
 

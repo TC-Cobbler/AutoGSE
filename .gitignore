@@ -1,5 +1,7 @@
 target/
 dist/
+playnite-plugin/bin/
+playnite-plugin/obj/
 roadmap.md
 Mockups/
 docs/

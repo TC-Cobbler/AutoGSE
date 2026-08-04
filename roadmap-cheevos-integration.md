@@ -180,8 +180,47 @@ This directly answers the question that started this integration effort — read
 
 ## Phase 6 — Reconcile AutoGSE's Own Roadmap
 
-- [ ] In AutoGSE's `roadmap.md`, mark Phase 13's remaining un-implemented items and all of Phase 15 as **superseded by the Cheevos fork**, not "not started" — prevents future confusion about whether they're still planned in Rust.
-- [ ] Freeze AutoGSE's own feature growth to what Phase 4 above needs for the companion contract. New user-facing features (overlays, playtime, rarity, scraping, store integrations) belong in Cheevos from here on, not AutoGSE.
+**Why now**: with Phase 0-5 done, AutoGSE's own `roadmap.md` (778 lines) is stale in ways that actively mislead a future reader — it still frames unimplemented Phase 13/15 GSE-parity work as "not started" (implying it's still planned in Rust, when the whole point of this document is that it isn't anymore), it still has GUI bug reports (Phase 16) against a GUI that Phase 0 above deleted, and Phase 17 already independently asked for a version bump + README rewrite — the exact two things this phase's last two bullets ask for, just at a stale target (`0.5.0`, pre-dating the Cheevos pivot entirely). This phase closes all of that out together rather than as separate, potentially-conflicting efforts.
+
+**Real drift already found while planning this, not hypothetical**: `Cargo.toml`'s `version` is already `0.3.0` (bumped in Phase 4), but `installer/autogse.iss`'s `MyAppVersion` is still `"0.2.0"` — confirmed directly by reading both files. The installer has been silently building under the wrong version string since Phase 4 landed. §6.3 fixes this as part of the 1.0.0 bump, not as a separate cleanup.
+
+### 6.1 Mark superseded work in `roadmap.md` — done
+- [x] **Phase 13**: only the genuinely-unimplemented items marked `[S]` superseded-by-Cheevos — ShadPS4/Xenia trophy parsers, the six store/launcher integrations (Epic/GOG/EA/Ubisoft/Xbox/LumaPlay), the rarity fetcher, visual completion analytics, manual achievement override. `rpcs3-trophies` and `export-achievements` left `[x]` done, explicitly **not** marked superseded — real, working AutoGSE capabilities in their own right. Noted the real duplication plainly (Cheevos's own `utils/rpcs3-*` independently re-parses the same trophy files in JS) rather than silently.
+- [x] **Phase 15** ("PSerban93/Achievements Feature Parity"), in full: every item across §15.1-§15.5 marked `[S]`, plus the phase heading itself. Left unchecked rather than retroactively `[x]`'d, so the original scoping isn't lost from history.
+- [x] **Phase 16**: both GUI bugs and both remaining items marked `[S]` — dead (no GUI left to have the bugs) or superseded (Cheevos already does header-image fetching; `loginusers.vdf` was separately ruled out on its own merits by this doc's own Phase 3).
+- [x] **Phase 17**: marked merged into this Phase 6, target raised to `1.0.0` — its two items map directly onto §6.3/§6.5 below.
+- [x] New `[S]` superseded token added to `roadmap.md`'s own status legend, pointing back at this section, so the marking is self-explanatory to a future reader without needing this doc open side-by-side.
+
+### 6.2 Freeze AutoGSE's own feature growth — done
+- [x] Added an unmissable freeze notice (blockquote) to `roadmap.md` right after its status legend, before Phase 1 — states the rule, points at this document for the reasoning, and explicitly clarifies the freeze is about new *features*, not abandoning the existing "Deferred/open items" bug list (left untouched, still open).
+
+### 6.3 Version bump to 1.0.0 — done, real drift fixed
+- [x] `Cargo.toml`'s `version`: `0.3.0` → `1.0.0`.
+- [x] `installer/autogse.iss`'s `MyAppVersion`: `"0.2.0"` → `"1.0.0"`, closing the real drift found while planning this — `OutputBaseFilename=AutoGSE-Setup-{#MyAppVersion}` picked up the corrected value automatically, confirmed by the real Inno Setup compile in §6.4 producing `AutoGSE-Setup-1.0.0.exe`.
+- [x] **Re-confirmed live, not just planned**: grepped the whole repo again post-bump for `0.2.0`/`0.3.0` — only `src/update_check.rs`'s version-*comparison* test literals remain (`compare("0.2.0", "v0.2.0")` etc.), correctly untouched.
+- [x] `cargo test --workspace` (plain debug profile, matching this doc's own established convention — see the real `--release`-vs-debug distinction found in §6.4) at the new `1.0.0`: **309 passed, 0 failed, 18 ignored** — byte-identical to Phase 4's own baseline count, confirming the version bump introduced zero regressions.
+
+### 6.4 Produce and verify a real standalone installer — build done and live-tested where possible; interactive install/uninstall round-trip blocked, needs the user
+**Scope correction confirmed, exactly as anticipated**: `installer/autogse.iss` already existed and already produced a standalone artifact; the only real gap was `dist/` being empty. Produced a current one, didn't author a new installer.
+- [x] **Real, concrete bug found by testing rather than assuming**: cleared `target/release/autogse.exe`/`autogse_shell.dll` and ran plain `cargo build --release` (no `--workspace`) — it compiled **only** `autogse` (the root package); `autogse_shell.dll` never appeared. Re-ran with `cargo build --release --workspace` and both binaries landed. Confirms `[workspace] members = ["shell-ext"]` having no `default-members` override really does mean the plain package build silently skips it — the README's old claim (`cargo build --release` alone) was actively wrong, not just under-specified. Fixed in §6.5's rewrite.
+- [x] `cargo build --release --workspace` — both `autogse.exe` and `autogse_shell.dll` built clean at `1.0.0`.
+- [x] Compiled `installer/autogse.iss` via a real Inno Setup install (`ISCC.exe`, found at the Chocolatey-installed path on this machine) — succeeded, `dist/AutoGSE-Setup-1.0.0.exe` (~105MB, in line with Phase 4.2's prior `~105MB` figure for the same four-tool-tree bundle).
+- [ ] **Blocked, not silently skipped**: attempted a real silent install (`/VERYSILENT /DIR=...`) to verify the registry/context-menu/uninstall round-trip. The installer's `PrivilegesRequired=admin` triggers a UAC consent dialog on its own isolated secure desktop — this session's sandboxed shell can neither answer it nor terminate the resulting process (`taskkill` returned Access Denied against both `AutoGSE-Setup-1.0.0.exe` and its extracted `.tmp` launcher). This is the same category of gap Phase 1.5/Phase 2.5 already flagged for UAC/Electron-blocked steps in this document — genuinely not attemptable unattended, not a corner that was cut. **Needs a human pass**: run `dist\AutoGSE-Setup-1.0.0.exe` interactively (or answer the UAC prompt this session already triggered), confirm context-menu entries register, right-click Inject/Revert against a real target, confirm the `IExplorerCommand` dynamic show/hide behaves correctly (closing `roadmap.md` Phase 11 §11.1's long-standing "never live-registered" gap), then uninstall and confirm full cleanup.
+- [x] **Flagged, not silently resolved**: confirmed `src/update_check.rs`'s `GITHUB_REPO_SLUG` is still the placeholder `"REPLACE_ME/autogse"`. Left as an explicit open decision for the user (real public repo vs. leave `check-update` non-functional for now) — not resolved by this phase, since fabricating a repo slug isn't this assistant's call to make.
+
+### 6.5 Rewrite README.md — done
+- [x] **Features section** rewritten from the real current CLI surface (`CONTRACT.md`'s own Appendix subcommand list), not re-derived from memory — now covers controller/mods/DLC, `steamclient` mode, LAN/multiplayer, save management, portable export/import, anti-cheat scanning, Steamless unpacking, RetroAchievements, and the companion `--json` contract, none of which the old README mentioned at all.
+- [x] New **"Standalone vs. with Cheevos"** section, directly after the intro — states the zero-dependency guarantee this session already confirmed and links to `roadmap-cheevos-integration.md`.
+- [x] New **"Steam credentials: why not just an API key?"** section — the specific ask carried over from the old Phase 17 item, grounded in this codebase's own real findings rather than invented: the CM-protocol-vs-Web-API distinction (Phase 3's `-acw` root-cause investigation) and the deprecated-`GetAppList`/unauthenticated-storesearch-endpoint finding (Phase 2.3 §Step 4), plus the existing DPAPI/no-CLI-flags credential-handling facts.
+- [x] **Project status section** rewritten — no longer frozen at "Phases 1-5... Phase 6 planned" (both stale); now states `v1.0.0`, points at `roadmap.md` for phase history and `roadmap-cheevos-integration.md` for the companion story, and states the freeze rule from §6.2 in the same terms `roadmap.md`'s own new banner uses.
+- [x] **Building from source section**: fixed per §6.4's real finding — `cargo build --release --workspace`, with an inline comment explaining why the plain form silently omits `autogse_shell.dll`, so this doesn't drift back to being wrong a second time.
+- [x] **Credits section**: confirmed unchanged, still accurate — no edit needed.
+
+### 6.6 Verify
+- [x] `cargo build --workspace` / `cargo test --workspace` clean at `1.0.0` — 309 passed, 0 failed, 18 ignored (§6.3).
+- [x] Repo-wide `0.2.0`/`0.3.0` grep re-confirmed post-bump — only the expected `update_check.rs` test literals remain (§6.3).
+- [ ] Real installer install/uninstall round-trip — blocked on the UAC prompt described in §6.4, needs the user to complete.
+- [x] Spot-checked the rewritten README's subcommand list and CLI examples directly against `CONTRACT.md`'s own Appendix (the same source of truth §6.5 cites), not against memory of what was written.
 
 ---
 
