@@ -16,9 +16,9 @@ use crate::appid::{self, AppIdContext};
 use crate::backup;
 use crate::backup_manager;
 use crate::cli::{
-    AddModArgs, AuditArgs, BackupAchievementsArgs, CliNetworkPreset, ConfigureOverlayArgs, DeployRealGlyphsArgs, ExportAchievementsArgs, ExportArgs,
-    ExportFormat, ImportArgs, InjectMode, JoinArgs, LanAction, LanArgs, ListArgs, ParseControllerVdfArgs, ReinjectArgs, RepairArgs, Rpcs3TrophiesArgs,
-    RestoreArgs, ScanArgs, SyncDirection, SyncSavesArgs, TargetArgs,
+    AddModArgs, AuditArgs, BackupAchievementsArgs, CliNetworkPreset, ConfigureOverlayArgs, DeployRealGlyphsArgs, DoctorArgs, ExportAchievementsArgs, ExportArgs,
+    ExportFormat, ImportArgs, InjectMode, JoinArgs, LanAction, LanArgs, ListArgs, LoginArgs, LogoutArgs, ParseControllerVdfArgs, ReinjectArgs, RepairArgs,
+    Rpcs3TrophiesArgs, RestoreArgs, ScanArgs, SyncDirection, SyncSavesArgs, TargetArgs,
 };
 use crate::rpcs3;
 use crate::controller_glyphs;
@@ -66,17 +66,54 @@ pub fn run_uninstall_menu() -> Result<(), AutoGseError> {
     Ok(())
 }
 
-pub fn run_login(interaction: &dyn Interaction) -> Result<(), AutoGseError> {
+/// `login`/`logout --json`'s contract shape (Phase 4 of
+/// roadmap-cheevos-integration.md) — never carries the password, same rule
+/// `doctor --json`'s `logged_in_as` already follows.
+#[derive(serde::Serialize)]
+struct JsonLoginResult {
+    success: bool,
+    username: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonLogoutResult {
+    success: bool,
+}
+
+pub fn run_login(args: &LoginArgs, interaction: &dyn Interaction) -> Result<(), AutoGseError> {
     let creds = interaction.capture_login()?;
     credentials::save(&creds)?;
     let username = creds.username.as_str().to_string();
     drop(creds); // zeroize the plaintext now — nothing below needs it
+
+    if args.json {
+        let result = JsonLoginResult { success: true, username: Some(username) };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
     println!("[AutoGSE] Logged in as {username}. Future injections will include achievement data automatically.");
     Ok(())
 }
 
-pub fn run_logout() -> Result<(), AutoGseError> {
+pub fn run_logout(args: &LogoutArgs) -> Result<(), AutoGseError> {
     credentials::delete()?;
+    // Cheevos-integration roadmap Phase 3: also drop any cached `-tok`
+    // session from the writable mirror (goldberg::ensure_writable_mirror) —
+    // otherwise a subsequent login as a *different* Steam account would
+    // still have the previous account's session cached, achievement data
+    // would come from the wrong account. Best-effort, like
+    // `credentials::delete_in`: not an error if there's nothing cached yet.
+    if let Ok(mirror) = goldberg::writable_tools_root() {
+        let _ = std::fs::remove_file(mirror.join("refresh_tokens.json"));
+    }
+
+    if args.json {
+        let result = JsonLogoutResult { success: true };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
     println!("[AutoGSE] Logged out. Stored Steam credentials removed. Your anonymous preference, if any, is unchanged.");
     Ok(())
 }
@@ -123,6 +160,14 @@ pub struct DoctorReport {
     pub dpapi_detail: String,
     pub known_target_count: Result<usize, String>,
     pub log_tail: Vec<String>,
+    /// Whether a Steam login is currently stored, and by whom — added
+    /// alongside `doctor --json` specifically because Cheevos's own Settings
+    /// UI has no other way to know this: `login`/`logout` only ever report
+    /// the outcome of an action taken in the current session, not state
+    /// read back after a restart (confirmed live: a real login, then an app
+    /// restart, showed "unknown" in Cheevos's UI even though
+    /// `credentials.dat` was untouched on disk the whole time).
+    pub logged_in_as: Option<String>,
 }
 
 pub fn collect_doctor_report() -> DoctorReport {
@@ -147,12 +192,50 @@ pub fn collect_doctor_report() -> DoctorReport {
 
     let known_target_count = index::load_existing_injected().map(|t| t.len()).map_err(|e| e.to_string());
     let log_tail = crate::log::tail(20).unwrap_or_default();
+    let logged_in_as = credentials::load().ok().flatten().map(|c| c.username.as_str().to_string());
 
-    DoctorReport { tool_checks, dpapi_ok, dpapi_detail, known_target_count, log_tail }
+    DoctorReport { tool_checks, dpapi_ok, dpapi_detail, known_target_count, log_tail, logged_in_as }
 }
 
-pub fn run_doctor() -> Result<(), AutoGseError> {
+#[derive(serde::Serialize)]
+struct JsonToolCheck {
+    name: &'static str,
+    ok: bool,
+    detail: String,
+}
+
+/// `doctor --json`'s contract shape. Deliberately omits `log_tail` — that's
+/// free-text console history, not structured status a caller would branch
+/// on, and the other `--json` commands (`scan`/`list`/`audit`) don't carry
+/// anything like it either.
+#[derive(serde::Serialize)]
+struct JsonDoctorReport {
+    tool_checks: Vec<JsonToolCheck>,
+    dpapi_ok: bool,
+    dpapi_detail: String,
+    known_target_count: Option<usize>,
+    logged_in_as: Option<String>,
+}
+
+pub fn run_doctor(args: &DoctorArgs) -> Result<(), AutoGseError> {
     let report = collect_doctor_report();
+
+    if args.json {
+        let json_report = JsonDoctorReport {
+            tool_checks: report
+                .tool_checks
+                .into_iter()
+                .map(|c| JsonToolCheck { name: c.name, ok: c.ok, detail: c.detail })
+                .collect(),
+            dpapi_ok: report.dpapi_ok,
+            dpapi_detail: report.dpapi_detail,
+            known_target_count: report.known_target_count.ok(),
+            logged_in_as: report.logged_in_as,
+        };
+        println!("{}", serde_json::to_string_pretty(&json_report)?);
+        return Ok(());
+    }
+
     println!("=== AutoGSE Doctor ===");
 
     for check in &report.tool_checks {
@@ -172,6 +255,11 @@ pub fn run_doctor() -> Result<(), AutoGseError> {
     match &report.known_target_count {
         Ok(n) => println!("[OK]   {n} known injected target(s) on this machine"),
         Err(e) => println!("[FAIL] known-target index: {e}"),
+    }
+
+    match &report.logged_in_as {
+        Some(username) => println!("[OK]   Logged in as {username}"),
+        None => println!("[ ]    Not logged in (injections will run anonymously — no achievement data)"),
     }
 
     if report.log_tail.is_empty() {
@@ -593,15 +681,30 @@ pub fn run_reinject(args: &ReinjectArgs) -> Result<(), AutoGseError> {
         )));
     }
 
-    println!(
-        "[AutoGSE] Restaged the Goldberg emulator DLL over {} ({arch}) — steam_settings/ and existing custom configuration were left untouched.",
-        resolution.tod.display()
-    );
     notify::show(
         "AutoGSE: Re-Injection Complete",
         &format!("Restored the Goldberg emulator after a Steam update reverted {}.", resolution.tod.display()),
     );
+
+    if args.json {
+        let result = JsonReinjectResult { path: resolution.tod.display().to_string(), arch: arch.to_string(), restaged_count: restaged };
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    println!(
+        "[AutoGSE] Restaged the Goldberg emulator DLL over {} ({arch}) — steam_settings/ and existing custom configuration were left untouched.",
+        resolution.tod.display()
+    );
     Ok(())
+}
+
+/// `reinject --json`'s contract shape (Phase 4).
+#[derive(serde::Serialize)]
+struct JsonReinjectResult {
+    path: String,
+    arch: String,
+    restaged_count: usize,
 }
 
 /// Phase 12 §12.2: diagnoses (and, where safe, fixes) a single target via
@@ -618,13 +721,39 @@ pub fn run_repair(args: &RepairArgs) -> Result<(), AutoGseError> {
     let resolution = discovery::resolve_target(&args.path, None)?;
     let diagnosis = diagnose_target(&resolution.tod)?;
 
+    // `RepairDiagnosis::NoManifest`/`StaleManifestVersion`/`BackupMissing`/
+    // `BackupHashMismatch` all return `Err` below (unrecoverable or requiring
+    // a fresh `inject`) — those still surface via the normal error path/exit
+    // code under `--json` too, per this phase's "failure is already carried
+    // by the exit code" scope; only the two `Ok` outcomes below get a JSON
+    // success payload.
     match diagnosis {
         RepairDiagnosis::Healthy => {
+            if args.json {
+                let result = JsonRepairResult {
+                    path: resolution.tod.display().to_string(),
+                    diagnosis: diagnosis.as_json_str(),
+                    action_taken: false,
+                    detail: None,
+                };
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
             println!("[AutoGSE] {} is healthy — nothing to repair.", resolution.tod.display());
             Ok(())
         }
         RepairDiagnosis::NoManifest => Err(AutoGseError::NotInjected(resolution.tod)),
         RepairDiagnosis::UpdateReverted => {
+            if args.json {
+                let result = JsonRepairResult {
+                    path: resolution.tod.display().to_string(),
+                    diagnosis: diagnosis.as_json_str(),
+                    action_taken: false,
+                    detail: Some(format!("run `reinject --path \"{}\"` instead", resolution.tod.display())),
+                };
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
             println!(
                 "[AutoGSE] {} is not corrupted — a Steam update reverted the live DLL to vanilla. Run `autogse reinject --path \"{}\"` instead.",
                 resolution.tod.display(),
@@ -662,6 +791,17 @@ pub fn run_repair(args: &RepairArgs) -> Result<(), AutoGseError> {
             backup::strip_readonly(&live_path)?;
             std::fs::remove_file(&live_path)?;
             std::fs::rename(&backup_path, &live_path)?;
+
+            if args.json {
+                let result = JsonRepairResult {
+                    path: resolution.tod.display().to_string(),
+                    diagnosis: "orphaned_backup",
+                    action_taken: true,
+                    detail: Some(format!("restored {dll_name} to vanilla from its orphaned backup; run `inject` fresh to complete it properly")),
+                };
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
             println!(
                 "[AutoGSE] Restored {} to vanilla from its orphaned backup ({dll_name} was mid-inject with no manifest ever written). Run `inject` fresh to complete it properly.",
                 resolution.tod.display()
@@ -669,6 +809,19 @@ pub fn run_repair(args: &RepairArgs) -> Result<(), AutoGseError> {
             Ok(())
         }
     }
+}
+
+/// `repair --json`'s contract shape (Phase 4) — mirrors `AuditFinding`'s
+/// shape discipline (stable `diagnosis` token via `RepairDiagnosis::
+/// as_json_str()`, optional human-readable `detail`), plus `action_taken`
+/// since `repair` (unlike `audit`) can actually mutate the target.
+#[derive(serde::Serialize)]
+struct JsonRepairResult {
+    path: String,
+    diagnosis: &'static str,
+    action_taken: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
 }
 
 /// Phase 12 §12.3's stable, scriptable per-target integrity payload — a
@@ -1189,14 +1342,54 @@ fn list_generated_settings_files(base: &Path, rel: &Path, out: &mut Vec<String>)
 /// subcommand's primary report (`scan`/`list`/`reinject`/...): a dry-run's
 /// entire purpose is to print a report, so it must not be silenced by the
 /// same flag that suppresses a real run's success chatter.
+/// `json`: when true, skips every `println!` below entirely and just
+/// returns the equivalent `JsonInjectResult` for the caller
+/// (`run_inject`/`run_inject_batch`) to serialize — when false, prints the
+/// exact same human-readable preview this function always has, byte-for-byte
+/// unchanged, so existing non-JSON callers (including `--silent --dry-run`,
+/// which has always printed this preview regardless of `--silent`) see no
+/// behavior change from this phase.
 fn report_dry_run_inject(
     resolution: &discovery::TargetResolution,
     app_id_resolution: &appid::AppIdResolution,
     arch: pe::Arch,
+    mode: InjectMode,
     forced_anon: bool,
     auth_mode: &AuthMode,
     gec_out: &Path,
-) -> Result<(), AutoGseError> {
+    json: bool,
+) -> Result<JsonInjectResult, AutoGseError> {
+    let achievement_included = matches!(auth_mode, AuthMode::Authenticated { .. });
+    let achievement_note = match (achievement_included, forced_anon) {
+        (true, _) => "would be included (Steam login configured)".to_string(),
+        (false, true) => "would NOT be included (--anon forces anonymous access)".to_string(),
+        (false, false) => "would NOT be included (no Steam login configured — a real interactive run may prompt you to log in first)".to_string(),
+    };
+
+    let generated_settings = gec_out.join("steam_settings");
+    let mut generated_files = Vec::new();
+    if generated_settings.is_dir() {
+        list_generated_settings_files(&generated_settings, Path::new(""), &mut generated_files)?;
+        generated_files.sort();
+        generated_files.push("steam_appid.txt".to_string());
+    }
+
+    if json {
+        return Ok(JsonInjectResult {
+            path: resolution.tod.display().to_string(),
+            status: "dry_run",
+            dry_run: true,
+            mode: Some(mode.to_string()),
+            arch: Some(arch.to_string()),
+            app_id: Some(app_id_resolution.app_id),
+            app_id_source: Some(app_id_resolution.source.as_str().to_string()),
+            game_title: app_id_resolution.game_title.clone(),
+            achievement_data_included: Some(achievement_included),
+            achievement_data_note: Some(achievement_note),
+            generated_files,
+        });
+    }
+
     println!("[AutoGSE] [dry-run] Nothing was changed — this is a preview only.");
     println!("[AutoGSE] [dry-run] Target: {} ({arch})", resolution.tod.display());
     println!(
@@ -1205,32 +1398,33 @@ fn report_dry_run_inject(
         app_id_resolution.source.as_str(),
         app_id_resolution.game_title.as_deref().map(|t| format!(", \"{t}\"")).unwrap_or_default()
     );
-
-    let achievement_note = match (matches!(auth_mode, AuthMode::Authenticated { .. }), forced_anon) {
-        (true, _) => "would be included (Steam login configured)".to_string(),
-        (false, true) => "would NOT be included (--anon forces anonymous access)".to_string(),
-        (false, false) => "would NOT be included (no Steam login configured — a real interactive run may prompt you to log in first)".to_string(),
-    };
     println!("[AutoGSE] [dry-run] Achievement data: {achievement_note}");
 
     let dll_name = resolution.dll_path.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     println!("[AutoGSE] [dry-run] Would back up {dll_name} -> {dll_name}.org, then swap in the Goldberg emulator DLL.");
 
-    let generated_settings = gec_out.join("steam_settings");
     if generated_settings.is_dir() {
-        let mut files = Vec::new();
-        list_generated_settings_files(&generated_settings, Path::new(""), &mut files)?;
-        files.sort();
-        println!("[AutoGSE] [dry-run] Would write {} file(s):", files.len() + 1);
-        for f in &files {
+        println!("[AutoGSE] [dry-run] Would write {} file(s):", generated_files.len());
+        for f in &generated_files {
             println!("[AutoGSE] [dry-run]   {f}");
         }
-        println!("[AutoGSE] [dry-run]   steam_appid.txt");
     } else {
         println!("[AutoGSE] [dry-run] generate_emu_config.exe produced no steam_settings/ output for this App ID.");
     }
     println!("[AutoGSE] [dry-run] Would write .gse_manifest.json to record this injection.");
-    Ok(())
+    Ok(JsonInjectResult {
+        path: resolution.tod.display().to_string(),
+        status: "dry_run",
+        dry_run: true,
+        mode: Some(mode.to_string()),
+        arch: Some(arch.to_string()),
+        app_id: Some(app_id_resolution.app_id),
+        app_id_source: Some(app_id_resolution.source.as_str().to_string()),
+        game_title: app_id_resolution.game_title.clone(),
+        achievement_data_included: Some(achievement_included),
+        achievement_data_note: Some(achievement_note),
+        generated_files,
+    })
 }
 
 /// Resolves which Steam access mode `run_inject_single` should use, per
@@ -1463,6 +1657,64 @@ fn unix_timestamp() -> String {
     format!("unix:{secs}")
 }
 
+/// `inject --json`'s contract shape (Phase 4) — built on every successful
+/// `run_inject_single` return path (already-injected no-op, interactive
+/// anti-cheat cancel, `--dry-run` preview, and a completed real injection),
+/// regardless of whether `--json` was actually passed: the struct is cheap
+/// to build and this keeps a single uniform return type rather than an
+/// `Option`/enum per call site. Callers (`run_inject`/`run_inject_batch`)
+/// decide whether to actually serialize it. Fields that don't apply to a
+/// given `status` (e.g. `arch`/`app_id` before PE bitness or App ID
+/// resolution has happened yet) are `None` and omitted from the JSON output.
+#[derive(serde::Serialize)]
+struct JsonInjectResult {
+    path: String,
+    /// Stable token: `"injected"` (completed), `"already_injected"` (no-op —
+    /// run `revert` first), `"cancelled"` (interactive anti-cheat prompt
+    /// declined), or `"dry_run"` (preview only, nothing changed).
+    status: &'static str,
+    dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    app_id_source: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    game_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    achievement_data_included: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    achievement_data_note: Option<String>,
+    /// Only populated for `--dry-run`'s preview (the real file list a full
+    /// run would produce) — a completed real injection doesn't repeat
+    /// `manifest.injected_files` here; Cheevos already re-derives that via
+    /// its own `folders:rescan` (roadmap §2.2).
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    generated_files: Vec<String>,
+}
+
+/// One `--root` batch entry's outcome — internally tagged so each element
+/// reads as either `{"outcome":"ok", ...JsonInjectResult fields}` or
+/// `{"outcome":"error","path":...,"message":...}` without a caller needing
+/// two different array shapes to branch on.
+#[derive(serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum JsonInjectBatchEntry {
+    Ok(JsonInjectResult),
+    Error { path: String, message: String },
+}
+
+#[derive(serde::Serialize)]
+struct JsonInjectBatchResult {
+    results: Vec<JsonInjectBatchEntry>,
+    succeeded: usize,
+    failed: usize,
+    total: usize,
+}
+
 /// Dispatches to a single-target or `--root` batch run (Phase 6 §6.8).
 /// `TargetArgs::path`/`root` are mutually exclusive and one is required,
 /// enforced by clap (`conflicts_with`/`required_unless_present`) — by the
@@ -1471,7 +1723,11 @@ pub fn run_inject(args: &TargetArgs, out: &Output, interaction: &dyn Interaction
     if let Some(root) = &args.root {
         return run_inject_batch(root, args, out, interaction);
     }
-    run_inject_single(args.path.as_deref().expect("clap guarantees path or root"), args, None, out, interaction)
+    let result = run_inject_single(args.path.as_deref().expect("clap guarantees path or root"), args, None, out, interaction)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    Ok(())
 }
 
 /// Scans `root` (`discovery::find_all_targets_under`) and injects every
@@ -1482,37 +1738,54 @@ fn run_inject_batch(root: &Path, args: &TargetArgs, out: &Output, interaction: &
     let targets = discovery::find_all_targets_under(root)?;
     if targets.is_empty() {
         out.info(format!("No injectable targets found under {}.", root.display()));
+        if args.json {
+            let batch = JsonInjectBatchResult { results: Vec::new(), succeeded: 0, failed: 0, total: 0 };
+            println!("{}", serde_json::to_string_pretty(&batch)?);
+        }
         return Ok(());
     }
 
     let auth_mode = resolve_auth_mode(args, !args.silent, out, interaction)?;
 
+    let mut results = Vec::with_capacity(targets.len());
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     for target in &targets {
         match run_inject_single(&target.tod, args, Some(auth_mode.clone()), out, interaction) {
-            Ok(()) => succeeded += 1,
+            Ok(result) => {
+                succeeded += 1;
+                results.push(JsonInjectBatchEntry::Ok(result));
+            }
             Err(e) => {
                 out.warn(format!("{}: {e}", target.tod.display()));
+                results.push(JsonInjectBatchEntry::Error { path: target.tod.display().to_string(), message: e.to_string() });
                 failed += 1;
             }
         }
     }
     out.info(format!("Batch inject complete: {succeeded} succeeded, {failed} failed, out of {} target(s).", targets.len()));
     drop(auth_mode); // the batch-wide original clone source — zeroize it now rather than at fn exit
+
+    if args.json {
+        let batch = JsonInjectBatchResult { results, succeeded, failed, total: targets.len() };
+        println!("{}", serde_json::to_string_pretty(&batch)?);
+    }
     Ok(())
 }
 
 /// `preresolved_auth`: `Some` when called from `run_inject_batch` (already
 /// resolved once for the whole batch); `None` for a normal single-target
 /// `inject --path`, which resolves it itself via `resolve_auth_mode` below.
+/// Always returns a `JsonInjectResult` on success (see that struct's own
+/// doc comment for why) — `run_inject`/`run_inject_batch` decide whether to
+/// print it.
 fn run_inject_single(
     path: &Path,
     args: &TargetArgs,
     preresolved_auth: Option<AuthMode>,
     out: &Output,
     interaction: &dyn Interaction,
-) -> Result<(), AutoGseError> {
+) -> Result<JsonInjectResult, AutoGseError> {
     let interactive = !args.silent;
     let prompt = interactive.then_some(interaction);
 
@@ -1534,7 +1807,19 @@ fn run_inject_single(
             "{} is already injected; use `autogse revert` first.",
             resolution.tod.display()
         ));
-        return Ok(());
+        return Ok(JsonInjectResult {
+            path: resolution.tod.display().to_string(),
+            status: "already_injected",
+            dry_run: args.dry_run,
+            mode: None,
+            arch: None,
+            app_id: None,
+            app_id_source: None,
+            game_title: None,
+            achievement_data_included: None,
+            achievement_data_note: None,
+            generated_files: Vec::new(),
+        });
     }
 
     let arch = pe::read_bitness(&resolution.dll_path)?;
@@ -1554,7 +1839,19 @@ fn run_inject_single(
             if interactive {
                 if !interaction.confirm_anticheat_findings(&findings) {
                     out.info("Injection cancelled after anti-cheat scan.");
-                    return Ok(());
+                    return Ok(JsonInjectResult {
+                        path: resolution.tod.display().to_string(),
+                        status: "cancelled",
+                        dry_run: args.dry_run,
+                        mode: Some(args.mode.to_string()),
+                        arch: Some(arch.to_string()),
+                        app_id: None,
+                        app_id_source: None,
+                        game_title: None,
+                        achievement_data_included: None,
+                        achievement_data_note: None,
+                        generated_files: Vec::new(),
+                    });
                 }
             } else {
                 out.warn(format!(
@@ -1600,7 +1897,7 @@ fn run_inject_single(
         let gec_out = tempfile::Builder::new().prefix("autogse_gec_dryrun_").tempdir()?;
         let gen_opts = goldberg::GenOptions { controller: args.controller, inventory: args.inventory };
         goldberg::run_generate_emu_config(app_id_resolution.app_id, gec_out.path(), &auth_mode, gen_opts)?;
-        return report_dry_run_inject(&resolution, &app_id_resolution, arch, args.anon, &auth_mode, gec_out.path());
+        return report_dry_run_inject(&resolution, &app_id_resolution, arch, args.mode, args.anon, &auth_mode, gec_out.path(), args.json);
     }
 
     // `steamclient` mode stages an alternate `steamclient(64).dll` loader
@@ -1794,6 +2091,11 @@ fn run_inject_single(
         .game_title
         .clone()
         .unwrap_or_else(|| resolution.tod.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+    // Captured before `manifest` below moves `app_id_resolution.game_title`
+    // out — this phase's `JsonInjectResult` needs it too, distinct from
+    // `display_title`'s folder-name fallback (JSON should report `None`
+    // when there really was no resolved title, not a synthesized one).
+    let game_title_for_json = app_id_resolution.game_title.clone();
 
     let manifest = GseManifest {
         version: manifest::MANIFEST_VERSION.to_string(),
@@ -1815,14 +2117,91 @@ fn run_inject_single(
         "AutoGSE: Injection Complete",
         &format!("Successfully injected {display_title} (AppID: {}).", app_id_resolution.app_id),
     );
-    Ok(())
+
+    let achievement_data_note = if is_authenticated {
+        "included (Steam login configured)".to_string()
+    } else {
+        "not included (anonymous Steam access) — run `autogse login` to enable achievement data".to_string()
+    };
+    Ok(JsonInjectResult {
+        path: resolution.tod.display().to_string(),
+        status: "injected",
+        dry_run: false,
+        mode: Some(args.mode.to_string()),
+        arch: Some(arch.to_string()),
+        app_id: Some(app_id_resolution.app_id),
+        app_id_source: Some(app_id_resolution.source.as_str().to_string()),
+        game_title: game_title_for_json,
+        achievement_data_included: Some(is_authenticated),
+        achievement_data_note: Some(achievement_data_note),
+        generated_files: Vec::new(),
+    })
+}
+
+/// `revert --json`'s contract shape (Phase 4) — same "always built, caller
+/// decides whether to print" discipline as `JsonInjectResult`.
+#[derive(serde::Serialize)]
+struct JsonRevertResult {
+    path: String,
+    /// Stable token: `"reverted"` (completed), `"nothing_to_revert"` (no-op
+    /// — target was never injected), or `"dry_run"` (preview only, nothing
+    /// changed).
+    status: &'static str,
+    dry_run: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restored_file_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed_file_count: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    leftover_backup_folder_count: Option<usize>,
+    /// `--dry-run` only: per backed-up file, whether its `.org` copy is
+    /// present and hash-verified — the same check a real revert would run.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    would_restore: Vec<JsonRevertRestorePreview>,
+    /// `--dry-run` only: `manifest.injected_files` — the config files a real
+    /// revert would remove.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    would_remove_files: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    would_remove_steam_settings: Option<bool>,
+}
+
+#[derive(serde::Serialize)]
+struct JsonRevertRestorePreview {
+    original_path: String,
+    backup_path: String,
+    /// True only when the backup is present and its hash matches the
+    /// manifest's recorded value — i.e. a real revert would succeed here.
+    ok: bool,
+    detail: String,
+}
+
+/// Same internally-tagged shape as `JsonInjectBatchEntry` — see that type's
+/// doc comment.
+#[derive(serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+enum JsonRevertBatchEntry {
+    Ok(JsonRevertResult),
+    Error { path: String, message: String },
+}
+
+#[derive(serde::Serialize)]
+struct JsonRevertBatchResult {
+    results: Vec<JsonRevertBatchEntry>,
+    succeeded: usize,
+    failed: usize,
+    total: usize,
 }
 
 pub fn run_revert(args: &TargetArgs, out: &Output, interaction: &dyn Interaction) -> Result<(), AutoGseError> {
     if let Some(root) = &args.root {
         return run_revert_batch(root, args, out, interaction);
     }
-    run_revert_single(args.path.as_deref().expect("clap guarantees path or root"), args, out, interaction)
+    let result = run_revert_single(args.path.as_deref().expect("clap guarantees path or root"), args, out, interaction)?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+    }
+    Ok(())
 }
 
 /// Reverts every target `discovery::find_all_targets_under(root)` finds.
@@ -1833,25 +2212,42 @@ fn run_revert_batch(root: &Path, args: &TargetArgs, out: &Output, interaction: &
     let targets = discovery::find_all_targets_under(root)?;
     if targets.is_empty() {
         out.info(format!("No targets found under {}.", root.display()));
+        if args.json {
+            let batch = JsonRevertBatchResult { results: Vec::new(), succeeded: 0, failed: 0, total: 0 };
+            println!("{}", serde_json::to_string_pretty(&batch)?);
+        }
         return Ok(());
     }
 
+    let mut results = Vec::with_capacity(targets.len());
     let mut succeeded = 0usize;
     let mut failed = 0usize;
     for target in &targets {
         match run_revert_single(&target.tod, args, out, interaction) {
-            Ok(()) => succeeded += 1,
+            Ok(result) => {
+                succeeded += 1;
+                results.push(JsonRevertBatchEntry::Ok(result));
+            }
             Err(e) => {
                 out.warn(format!("{}: {e}", target.tod.display()));
+                results.push(JsonRevertBatchEntry::Error { path: target.tod.display().to_string(), message: e.to_string() });
                 failed += 1;
             }
         }
     }
     out.info(format!("Batch revert complete: {succeeded} succeeded, {failed} failed, out of {} target(s).", targets.len()));
+
+    if args.json {
+        let batch = JsonRevertBatchResult { results, succeeded, failed, total: targets.len() };
+        println!("{}", serde_json::to_string_pretty(&batch)?);
+    }
     Ok(())
 }
 
-fn run_revert_single(path: &Path, args: &TargetArgs, out: &Output, interaction: &dyn Interaction) -> Result<(), AutoGseError> {
+/// Always returns a `JsonRevertResult` on success — see that struct's doc
+/// comment for why. `run_revert`/`run_revert_batch` decide whether to print
+/// it.
+fn run_revert_single(path: &Path, args: &TargetArgs, out: &Output, interaction: &dyn Interaction) -> Result<JsonRevertResult, AutoGseError> {
     let interactive = !args.silent;
 
     let d_root = discovery::compute_d_root(path)?;
@@ -1861,21 +2257,33 @@ fn run_revert_single(path: &Path, args: &TargetArgs, out: &Output, interaction: 
 
     let Some(manifest) = manifest::load(&resolution.tod)? else {
         out.info(format!("Nothing to revert at {}.", resolution.tod.display()));
-        return Ok(());
+        return Ok(JsonRevertResult {
+            path: resolution.tod.display().to_string(),
+            status: "nothing_to_revert",
+            dry_run: args.dry_run,
+            restored_file_count: None,
+            removed_file_count: None,
+            leftover_backup_folder_count: None,
+            would_restore: Vec::new(),
+            would_remove_files: Vec::new(),
+            would_remove_steam_settings: None,
+        });
     };
 
     if args.dry_run {
-        return report_dry_run_revert(&resolution, &manifest);
+        return report_dry_run_revert(&resolution, &manifest, args.json);
     }
 
+    let restored_file_count = manifest.backed_up_files.len();
     for entry in &manifest.backed_up_files {
         restore_one(&resolution.tod, entry)?;
     }
 
+    let mut removed_file_count = 0usize;
     for rel_path in &manifest.injected_files {
         let path = resolution.tod.join(rel_path);
         match std::fs::remove_file(&path) {
-            Ok(()) => {}
+            Ok(()) => removed_file_count += 1,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(AutoGseError::Io(e)),
         }
@@ -1911,7 +2319,17 @@ fn run_revert_single(path: &Path, args: &TargetArgs, out: &Output, interaction: 
         None => "Removed the steamclient loader files and emulator configs.".to_string(),
     };
     notify::show("AutoGSE: Rollback Complete", &notify_body);
-    Ok(())
+    Ok(JsonRevertResult {
+        path: resolution.tod.display().to_string(),
+        status: "reverted",
+        dry_run: false,
+        restored_file_count: Some(restored_file_count),
+        removed_file_count: Some(removed_file_count),
+        leftover_backup_folder_count: Some(bak_count),
+        would_restore: Vec::new(),
+        would_remove_files: Vec::new(),
+        would_remove_steam_settings: None,
+    })
 }
 
 /// Phase 12 §12.1's `revert --dry-run`: verifies each `.org` backup's hash
@@ -1919,25 +2337,52 @@ fn run_revert_single(path: &Path, args: &TargetArgs, out: &Output, interaction: 
 /// contract is verify-then-restore with no verify-only mode) and reports
 /// what would be removed, without calling `restore_one`, `remove_file`,
 /// `remove_dir_all`, `manifest::remove`, or `index::forget`.
-fn report_dry_run_revert(resolution: &discovery::TargetResolution, manifest: &GseManifest) -> Result<(), AutoGseError> {
+///
+/// `json`: when true, skips every `println!` below and just returns the
+/// equivalent `JsonRevertResult` — when false, prints the exact same
+/// human-readable preview this function always has, unchanged by this phase.
+fn report_dry_run_revert(resolution: &discovery::TargetResolution, manifest: &GseManifest, json: bool) -> Result<JsonRevertResult, AutoGseError> {
+    let would_restore: Vec<JsonRevertRestorePreview> = manifest
+        .backed_up_files
+        .iter()
+        .map(|entry| {
+            let backup_path = resolution.tod.join(&entry.backup_path);
+            let (ok, detail) = if !backup_path.is_file() {
+                (false, "MISSING — revert would fail here".to_string())
+            } else {
+                match backup::sha256_file(&backup_path) {
+                    Ok(actual) if actual == entry.sha256_hash => (true, "hash OK".to_string()),
+                    Ok(actual) => (false, format!("HASH MISMATCH (expected {}, found {actual}) — revert would fail here", entry.sha256_hash)),
+                    Err(e) => (false, format!("could not hash ({e}) — revert would fail here")),
+                }
+            };
+            JsonRevertRestorePreview { original_path: entry.original_path.clone(), backup_path: entry.backup_path.clone(), ok, detail }
+        })
+        .collect();
+    let would_remove_steam_settings = resolution.tod.join("steam_settings").is_dir();
+
+    if json {
+        return Ok(JsonRevertResult {
+            path: resolution.tod.display().to_string(),
+            status: "dry_run",
+            dry_run: true,
+            restored_file_count: None,
+            removed_file_count: None,
+            leftover_backup_folder_count: None,
+            would_restore,
+            would_remove_files: manifest.injected_files.clone(),
+            would_remove_steam_settings: Some(would_remove_steam_settings),
+        });
+    }
+
     println!("[AutoGSE] [dry-run] Nothing was changed — this is a preview only.");
     println!("[AutoGSE] [dry-run] Target: {}", resolution.tod.display());
 
     if manifest.backed_up_files.is_empty() {
         println!("[AutoGSE] [dry-run] No backed-up files recorded (steamclient mode never swaps a DLL).");
     }
-    for entry in &manifest.backed_up_files {
-        let backup_path = resolution.tod.join(&entry.backup_path);
-        let status = if !backup_path.is_file() {
-            "MISSING — revert would fail here".to_string()
-        } else {
-            match backup::sha256_file(&backup_path) {
-                Ok(actual) if actual == entry.sha256_hash => "hash OK".to_string(),
-                Ok(actual) => format!("HASH MISMATCH (expected {}, found {actual}) — revert would fail here", entry.sha256_hash),
-                Err(e) => format!("could not hash ({e}) — revert would fail here"),
-            }
-        };
-        println!("[AutoGSE] [dry-run] Would restore {} <- {} ({status}).", entry.original_path, entry.backup_path);
+    for preview in &would_restore {
+        println!("[AutoGSE] [dry-run] Would restore {} <- {} ({}).", preview.original_path, preview.backup_path, preview.detail);
     }
 
     println!("[AutoGSE] [dry-run] Would remove {} tracked injected file(s):", manifest.injected_files.len());
@@ -1945,11 +2390,21 @@ fn report_dry_run_revert(resolution: &discovery::TargetResolution, manifest: &Gs
         println!("[AutoGSE] [dry-run]   {f}");
     }
 
-    if resolution.tod.join("steam_settings").is_dir() {
+    if would_remove_steam_settings {
         println!("[AutoGSE] [dry-run] Would remove steam_settings/ entirely.");
     }
     println!("[AutoGSE] [dry-run] Would remove .gse_manifest.json and forget this target.");
-    Ok(())
+    Ok(JsonRevertResult {
+        path: resolution.tod.display().to_string(),
+        status: "dry_run",
+        dry_run: true,
+        restored_file_count: None,
+        removed_file_count: None,
+        leftover_backup_folder_count: None,
+        would_restore,
+        would_remove_files: manifest.injected_files.clone(),
+        would_remove_steam_settings: Some(would_remove_steam_settings),
+    })
 }
 
 fn restore_one(target_dir: &Path, entry: &BackedUpFile) -> Result<(), AutoGseError> {
@@ -2237,7 +2692,7 @@ mod tests {
         std::fs::create_dir_all(dir.path().join("steam_settings")).unwrap();
         std::fs::write(dir.path().join("steam_settings").join("configs.main.ini"), "custom config").unwrap();
 
-        run_reinject(&ReinjectArgs { path: dir.path().to_path_buf() }).unwrap();
+        run_reinject(&ReinjectArgs { path: dir.path().to_path_buf(), json: false }).unwrap();
 
         let restaged = std::fs::read(dir.path().join("steam_api64.dll")).unwrap();
         let goldberg_dll = std::fs::read(goldberg::dll_source_path(pe::Arch::X64).unwrap()).unwrap();
@@ -2278,7 +2733,7 @@ mod tests {
         };
         manifest::save(dir.path(), &manifest).unwrap();
 
-        let result = run_reinject(&ReinjectArgs { path: dir.path().to_path_buf() });
+        let result = run_reinject(&ReinjectArgs { path: dir.path().to_path_buf(), json: false });
 
         assert!(matches!(result, Err(AutoGseError::ReinjectNotApplicable(_))));
     }
@@ -2288,7 +2743,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_reinject_fixture(dir.path(), "steamclient");
 
-        let result = run_reinject(&ReinjectArgs { path: dir.path().to_path_buf() });
+        let result = run_reinject(&ReinjectArgs { path: dir.path().to_path_buf(), json: false });
 
         assert!(matches!(result, Err(AutoGseError::ReinjectNotApplicable(_))));
     }
@@ -2435,7 +2890,7 @@ mod tests {
     fn run_repair_reports_healthy_as_a_noop() {
         let dir = tempfile::tempdir().unwrap();
         write_healthy_fixture(dir.path());
-        run_repair(&RepairArgs { path: dir.path().to_path_buf() }).unwrap();
+        run_repair(&RepairArgs { path: dir.path().to_path_buf(), json: false }).unwrap();
     }
 
     #[test]
@@ -2443,7 +2898,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("steam_api64.dll"), b"vanilla dll bytes").unwrap();
 
-        let result = run_repair(&RepairArgs { path: dir.path().to_path_buf() });
+        let result = run_repair(&RepairArgs { path: dir.path().to_path_buf(), json: false });
 
         assert!(matches!(result, Err(AutoGseError::NotInjected(_))));
     }
@@ -2455,7 +2910,7 @@ mod tests {
         std::fs::write(dir.path().join("steam_api64.dll.org"), vanilla_bytes).unwrap();
         std::fs::write(dir.path().join("steam_api64.dll"), b"goldberg dll bytes").unwrap();
 
-        run_repair(&RepairArgs { path: dir.path().to_path_buf() }).unwrap();
+        run_repair(&RepairArgs { path: dir.path().to_path_buf(), json: false }).unwrap();
 
         assert_eq!(std::fs::read(dir.path().join("steam_api64.dll")).unwrap(), vanilla_bytes);
         assert!(!dir.path().join("steam_api64.dll.org").is_file(), "the orphaned backup should be consumed by the restore");
@@ -2468,7 +2923,7 @@ mod tests {
         std::fs::write(dir.path().join("steam_api64.dll.org"), b"corrupted bytes").unwrap();
         let before = std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap();
 
-        let result = run_repair(&RepairArgs { path: dir.path().to_path_buf() });
+        let result = run_repair(&RepairArgs { path: dir.path().to_path_buf(), json: false });
 
         assert!(matches!(result, Err(AutoGseError::RepairFailed(_))));
         assert_eq!(std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap(), before, "repair must not touch a backup it can't safely restore");
@@ -2479,7 +2934,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         write_reinject_fixture(dir.path(), "regular");
         // Not corrupted, and not fixed by `repair` — `reinject` owns this case.
-        run_repair(&RepairArgs { path: dir.path().to_path_buf() }).unwrap();
+        run_repair(&RepairArgs { path: dir.path().to_path_buf(), json: false }).unwrap();
         assert_eq!(classify_target(dir.path()).unwrap(), ScanStatus::UpdateReverted, "repair must not touch an UpdateReverted target");
     }
 
@@ -2522,6 +2977,10 @@ mod tests {
     // -- Phase 12 §12.1: --dry-run -----------------------------------------
 
     fn target_args_dry_run(path: &std::path::Path, dry_run: bool) -> TargetArgs {
+        target_args_dry_run_json(path, dry_run, false)
+    }
+
+    fn target_args_dry_run_json(path: &std::path::Path, dry_run: bool, json: bool) -> TargetArgs {
         TargetArgs {
             path: Some(path.to_path_buf()),
             root: None,
@@ -2542,6 +3001,7 @@ mod tests {
             skip_ac_scan: true,
             unpack_steamstub: false,
             dry_run,
+            json,
         }
     }
 
@@ -2612,6 +3072,96 @@ mod tests {
 
         assert_eq!(std::fs::read(dir.path().join("steam_api64.dll.org")).unwrap(), before_backup, "dry-run must not touch a mismatched backup either");
         assert!(manifest::exists(dir.path()));
+    }
+
+    // -- Phase 4 (roadmap-cheevos-integration.md): --json on inject/revert -
+
+    #[test]
+    fn revert_single_json_dry_run_reports_stable_token_and_preview_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        write_full_injected_fixture(dir.path());
+
+        let args = target_args_dry_run_json(dir.path(), true, true);
+        let out = Output::new_with_json(true, true);
+        let interaction = crate::interaction::StdioInteraction;
+        let result = run_revert_single(dir.path(), &args, &out, &interaction).unwrap();
+
+        assert_eq!(result.status, "dry_run");
+        assert!(result.dry_run);
+        assert_eq!(result.restored_file_count, None);
+        assert_eq!(result.would_restore.len(), 1);
+        assert!(result.would_restore[0].ok, "a real backup with a matching hash should preview as ok");
+        assert_eq!(result.would_restore[0].original_path, "steam_api64.dll");
+        assert!(result.would_remove_files.contains(&"steam_appid.txt".to_string()));
+        assert_eq!(result.would_remove_steam_settings, Some(true));
+    }
+
+    #[test]
+    fn revert_single_json_reports_nothing_to_revert_on_a_vanilla_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("steam_api64.dll"), b"vanilla dll bytes").unwrap();
+
+        let args = target_args_dry_run_json(dir.path(), false, true);
+        let out = Output::new_with_json(true, true);
+        let interaction = crate::interaction::StdioInteraction;
+        let result = run_revert_single(dir.path(), &args, &out, &interaction).unwrap();
+
+        assert_eq!(result.status, "nothing_to_revert");
+    }
+
+    // A real (non-dry-run) `revert_single_json_*` test intentionally isn't
+    // here: `run_revert_single`'s real path calls the public `index::forget`,
+    // which touches this actual machine's real `%LOCALAPPDATA%\AutoGSE\
+    // known_targets.json` — exactly what `record_in`/`forget_in` (see
+    // `index.rs`'s own tests) exist to let tests avoid, and the same reason
+    // `cli_smoke.rs`'s `inject_then_revert_round_trips` is `#[ignore]`d
+    // rather than run by default. Confirmed live: adding this test here
+    // reliably crashed the whole suite with a Windows STATUS_ACCESS_VIOLATION
+    // when run alongside ~280 other tests in the same process (passed fine
+    // in isolation) — real per-machine global state this deep into a large
+    // test process is exactly the kind of fragile interaction this
+    // codebase's existing tests are structured to avoid. The `reverted`
+    // status/count fields are simple pass-throughs of values already
+    // exercised by `revert_dry_run_leaves_everything_on_disk_untouched`
+    // (restored/removed file identification) and the pre-existing
+    // non-JSON revert tests — verified live instead via a real CLI
+    // `revert --json` run (see roadmap-cheevos-integration.md Phase 4).
+
+    #[test]
+    fn inject_single_json_reports_already_injected_status_without_resolving_app_id() {
+        let dir = tempfile::tempdir().unwrap();
+        write_full_injected_fixture(dir.path());
+
+        let args = target_args_dry_run_json(dir.path(), false, true);
+        let out = Output::new_with_json(true, true);
+        let interaction = crate::interaction::StdioInteraction;
+        let result = run_inject_single(dir.path(), &args, None, &out, &interaction).unwrap();
+
+        assert_eq!(result.status, "already_injected");
+        assert_eq!(result.app_id, None, "app id resolution never runs for an already-injected no-op");
+        assert_eq!(result.arch, None);
+    }
+
+    #[test]
+    fn run_repair_json_healthy_does_not_panic_on_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        write_healthy_fixture(dir.path());
+        run_repair(&RepairArgs { path: dir.path().to_path_buf(), json: true }).unwrap();
+    }
+
+    #[test]
+    fn run_repair_json_orphaned_backup_does_not_panic_on_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("steam_api64.dll.org"), b"vanilla dll bytes").unwrap();
+        std::fs::write(dir.path().join("steam_api64.dll"), b"goldberg dll bytes").unwrap();
+        run_repair(&RepairArgs { path: dir.path().to_path_buf(), json: true }).unwrap();
+    }
+
+    #[test]
+    fn run_reinject_json_does_not_panic_on_serialization() {
+        let dir = tempfile::tempdir().unwrap();
+        write_reinject_fixture(dir.path(), "regular");
+        run_reinject(&ReinjectArgs { path: dir.path().to_path_buf(), json: true }).unwrap();
     }
 
     // -- Phase 13: export-achievements ------------------------------------

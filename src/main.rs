@@ -50,17 +50,17 @@ fn run(command: Command) -> Result<(), AutoGseError> {
     let interaction = StdioInteraction;
     match command {
         Command::Inject(args) => {
-            let out = Output::new(args.silent);
+            let out = Output::new_with_json(args.silent, args.json);
             engine::run_inject(&args, &out, &interaction)
         }
         Command::Revert(args) => {
-            let out = Output::new(args.silent);
+            let out = Output::new_with_json(args.silent, args.json);
             engine::run_revert(&args, &out, &interaction)
         }
         Command::InstallMenu => engine::run_install_menu(),
         Command::UninstallMenu => engine::run_uninstall_menu(),
-        Command::Login => engine::run_login(&interaction),
-        Command::Logout => engine::run_logout(),
+        Command::Login(args) => engine::run_login(&args, &interaction),
+        Command::Logout(args) => engine::run_logout(&args),
         Command::RaLogin => engine::run_ra_login(),
         Command::RaLogout => engine::run_ra_logout(),
         Command::ParseControllerVdf(args) => engine::run_parse_controller_vdf(&args),
@@ -72,7 +72,7 @@ fn run(command: Command) -> Result<(), AutoGseError> {
         Command::Reinject(args) => engine::run_reinject(&args),
         Command::Repair(args) => engine::run_repair(&args),
         Command::Audit(args) => engine::run_audit(&args),
-        Command::Doctor => engine::run_doctor(),
+        Command::Doctor(args) => engine::run_doctor(&args),
         Command::CheckUpdate => engine::run_check_update(),
         Command::SyncSaves(args) => engine::run_sync_saves(&args),
         Command::DeployRealGlyphs(args) => engine::run_deploy_real_glyphs(&args),

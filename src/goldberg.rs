@@ -2,7 +2,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use crate::credentials;
 use crate::error::AutoGseError;
+use crate::mutex_engine::AutoGseLock;
 use crate::pe::Arch;
 use crate::secret::SecretString;
 
@@ -22,11 +24,13 @@ const GENERATE_EMU_CONFIG_TIMEOUT_AUTH: Duration = Duration::from_secs(180);
 /// Resolved Steam access mode for one `generate_emu_config.exe` invocation.
 /// `Anonymous` is Phase 3's original, unchanged path (`-anon -skip_ach`).
 /// `Authenticated` is Phase 5: real credentials via env vars (never a
-/// plaintext `my_login.txt` on disk), simply omitting `-anon` (not `-tok` —
-/// see `run_generate_emu_config`'s own comment for why that flag is
-/// deliberately never passed), and `-acw` re-enabled since achievement data
-/// — confirmed live to hang under anonymous login regardless of `-acw`
-/// specifically — needs a real account.
+/// plaintext `my_login.txt` on disk), simply omitting `-anon`, `-acw`
+/// re-enabled since achievement data — confirmed live to hang under
+/// anonymous login regardless of `-acw` specifically — needs a real account,
+/// and (Cheevos-integration roadmap Phase 3) `-tok` to cache the login
+/// session so a second authenticated run doesn't re-prompt for Steam Guard —
+/// see `ensure_writable_mirror`'s doc comment for why that requires running
+/// against a mirrored copy of the tool rather than `tools_root()` directly.
 #[derive(Clone)]
 pub enum AuthMode {
     Anonymous,
@@ -72,6 +76,113 @@ pub fn tools_root() -> Result<PathBuf, AutoGseError> {
     } else {
         Err(AutoGseError::VendoredToolsNotFound(release_path))
     }
+}
+
+const MIRROR_LOCK_TIMEOUT_MS: u32 = 10_000;
+const MIRROR_STAMP_FILENAME: &str = ".mirror_source";
+const REFRESH_TOKENS_FILENAME: &str = "refresh_tokens.json";
+
+/// Per-user writable mirror of `tools_root()` (Cheevos-integration roadmap
+/// Phase 3, "session reuse"). See `ensure_writable_mirror` for why this
+/// exists; this just resolves where it lives, reusing the same
+/// `%LOCALAPPDATA%\AutoGSE\` base directory `credentials::store_dir` already
+/// established rather than inventing a new one.
+pub fn writable_tools_root() -> Result<PathBuf, AutoGseError> {
+    Ok(credentials::store_dir()?.join("gen_emu_cfg_cache"))
+}
+
+/// Identifies the exact `tools_root()` build a mirror was built from (exe
+/// size + modified time) — cheap to check on every authenticated run, and
+/// precise enough to detect an AutoGSE upgrade shipping a newer vendored
+/// tool, without needing a real content hash of 1,250 files.
+fn mirror_source_stamp(exe: &Path) -> Result<String, AutoGseError> {
+    let meta = std::fs::metadata(exe)?;
+    let modified = meta.modified()?.duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    Ok(format!("{}:{}", meta.len(), modified))
+}
+
+/// Recursively hard-links `src`'s tree into `dst`, falling back to a real
+/// per-file copy only if hard-linking that file fails (e.g. `src`/`dst` on
+/// different volumes). Mirrors `copy_dir_recursive`'s structure but avoids
+/// duplicating the vendored tool tree's real file data (confirmed today:
+/// 149MB across 1,250 files) on the common same-volume case, where a hard
+/// link costs nothing beyond a directory entry.
+fn mirror_dir_recursive(src: &Path, dst: &Path) -> Result<(), AutoGseError> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+        if entry.file_type()?.is_dir() {
+            mirror_dir_recursive(&src_path, &dst_path)?;
+        } else if std::fs::hard_link(&src_path, &dst_path).is_err() {
+            std::fs::copy(&src_path, &dst_path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Ensures a current writable mirror of `tools_root()` exists and returns its
+/// path, (re)building it if missing or stale.
+///
+/// `generate_emu_config.exe`'s `-tok` flag ("save login_token to disk") saves
+/// `refresh_tokens.json` beside its own exe with no way to redirect that path
+/// — confirmed by re-running the vendored tool with no arguments: neither the
+/// flag list nor `GSE_CFG_USERNAME`/`GSE_CFG_PASSWORD` offer a cache-directory
+/// override. In a real install `tools_root()` is
+/// `C:\Program Files\AutoGSE\gen_emu_cfg\`, unwritable by a normal
+/// non-elevated process (the exact failure this phase's predecessor hit:
+/// `PermissionError: [Errno 13] Permission denied: '...\gen_emu_cfg\refresh_tokens.json'`,
+/// per `roadmap.md`'s Phase 5). Rather than relocate the whole install
+/// directory or rely on a symlink (needs `SeCreateSymbolicLinkPrivilege`, not
+/// held by a non-elevated runtime process), authenticated runs execute a
+/// hard-linked mirror of `tools_root()` under `writable_tools_root()`
+/// instead — a normal per-user-writable directory `-tok` can write beside
+/// itself freely. Anonymous runs never call this; they keep reading
+/// `tools_root()` directly.
+///
+/// Guarded by the same directory-scoped, cross-process named mutex
+/// (`mutex_engine::AutoGseLock`) inject/revert already use elsewhere, keyed
+/// on the mirror directory itself, so two authenticated injects starting at
+/// once can't race on first-time mirror construction.
+///
+/// A stale mirror (source exe's size/mtime changed — an AutoGSE upgrade
+/// shipped a newer vendored tool) is rebuilt from scratch, but any real
+/// cached `refresh_tokens.json` already in the old mirror is preserved into
+/// the rebuilt one first, so an upgrade doesn't silently force every user to
+/// re-login.
+pub fn ensure_writable_mirror() -> Result<PathBuf, AutoGseError> {
+    let source = tools_root()?;
+    let mirror = writable_tools_root()?;
+    let _lock = AutoGseLock::acquire(&mirror, MIRROR_LOCK_TIMEOUT_MS)?;
+    ensure_mirror_at(&source, &mirror)?;
+    Ok(mirror)
+}
+
+/// Build/rebuild-if-stale logic behind `ensure_writable_mirror`, split out
+/// (same rationale as `skip_flags_for`) so it's directly testable against
+/// `tempfile::tempdir()` source/mirror pairs, without needing the real
+/// 149MB vendored tree, the real `%LOCALAPPDATA%`, or the cross-process lock.
+fn ensure_mirror_at(source: &Path, mirror: &Path) -> Result<(), AutoGseError> {
+    let current_stamp = mirror_source_stamp(&source.join("generate_emu_config.exe"))?;
+    let stamp_path = mirror.join(MIRROR_STAMP_FILENAME);
+    if std::fs::read_to_string(&stamp_path).ok().as_deref() == Some(current_stamp.as_str()) {
+        return Ok(());
+    }
+
+    let preserved_tokens = std::fs::read(mirror.join(REFRESH_TOKENS_FILENAME)).ok();
+
+    if mirror.is_dir() {
+        std::fs::remove_dir_all(mirror)?;
+    }
+    mirror_dir_recursive(source, mirror)?;
+
+    if let Some(tokens) = preserved_tokens {
+        std::fs::write(mirror.join(REFRESH_TOKENS_FILENAME), tokens)?;
+    }
+    std::fs::write(&stamp_path, current_stamp)?;
+
+    Ok(())
 }
 
 /// Resolves the vendored `parse_controller_vdf` tool's directory (Phase 6
@@ -350,12 +461,14 @@ fn tail_lines(s: &str, max_lines: usize) -> String {
 /// optimization, not a hard requirement — so this is deferred rather than
 /// blocking the core inject/revert pipeline.
 ///
-/// `auth` selects between Phase 3's unchanged anonymous path and Phase 5's
-/// authenticated one (just omitting `-anon`, plus `-acw`; credentials
-/// passed as env vars on this child process only — confirmed via the
-/// vendored tool's own README that `GSE_CFG_USERNAME`/`GSE_CFG_PASSWORD`
-/// override a `my_login.txt` file, so AutoGSE uses only the env-var
-/// mechanism and never writes that file to disk).
+/// `auth` selects between Phase 3's unchanged anonymous path (runs directly
+/// against `tools_root()`) and Phase 5's authenticated one (`-acw` plus
+/// `-tok`, run against `ensure_writable_mirror()`'s mirrored copy instead —
+/// see that function's doc comment for why; credentials passed as env vars
+/// on this child process only — confirmed via the vendored tool's own README
+/// that `GSE_CFG_USERNAME`/`GSE_CFG_PASSWORD` override a `my_login.txt` file,
+/// so AutoGSE uses only the env-var mechanism and never writes that file to
+/// disk).
 /// Pure, directly testable mapping from `GenOptions` to the
 /// `-skip_con`/`-skip_inv` flags — split out from `run_generate_emu_config`
 /// so this logic doesn't need a real process spawn to verify.
@@ -371,7 +484,13 @@ fn skip_flags_for(opts: GenOptions) -> Vec<&'static str> {
 }
 
 pub fn run_generate_emu_config(app_id: u64, out_dir: &Path, auth: &AuthMode, opts: GenOptions) -> Result<(), AutoGseError> {
-    let exe = tools_root()?.join("generate_emu_config.exe");
+    // Anonymous runs read the real (possibly read-only, e.g. Program Files)
+    // install directly; authenticated runs need `ensure_writable_mirror`'s
+    // copy so `-tok` below has somewhere writable to save its session to.
+    let exe = match auth {
+        AuthMode::Anonymous => tools_root()?.join("generate_emu_config.exe"),
+        AuthMode::Authenticated { .. } => ensure_writable_mirror()?.join("generate_emu_config.exe"),
+    };
     let mut cmd = Command::new(&exe);
     cmd.args(["-rel_raw", "-clr"]).args(skip_flags_for(opts));
     // `run_with_timeout` now pipes this process's stdout/stderr (to relay
@@ -388,18 +507,15 @@ pub fn run_generate_emu_config(app_id: u64, out_dir: &Path, auth: &AuthMode, opt
             GENERATE_EMU_CONFIG_TIMEOUT_ANON
         }
         AuthMode::Authenticated { username, password } => {
-            // Deliberately no `-tok`: confirmed live (this phase) that it
-            // makes the tool try to write `refresh_tokens.json` beside its
-            // own exe — `tools_root()`, which in a real install is
-            // `C:\Program Files\AutoGSE\gen_emu_cfg\`, not writable by a
-            // normal (non-elevated) process, causing a guaranteed
-            // `PermissionError` on every authenticated run from a real
-            // install. `-tok` only caches the login session for reuse
-            // (confirmed from the tool's own `--help`: real-vs-anonymous
-            // login is controlled purely by `-anon`'s absence); AutoGSE
-            // always supplies fresh credentials via env vars on every
-            // invocation anyway, so that cache is never relied upon.
-            cmd.args(["-acw"]).env("GSE_CFG_USERNAME", username.as_str()).env("GSE_CFG_PASSWORD", password.as_str());
+            // `-tok` (Cheevos-integration roadmap Phase 3): caches the login
+            // session in `refresh_tokens.json` beside the exe so a second
+            // authenticated run doesn't re-prompt for Steam Guard. Safe now
+            // that `exe` above resolves to the writable mirror rather than
+            // `tools_root()` directly — see `ensure_writable_mirror`'s doc
+            // comment for the full history of why this was avoided before.
+            // Credentials are still supplied via env vars on every run
+            // regardless of the cached session, unchanged from Phase 5.
+            cmd.args(["-acw", "-tok"]).env("GSE_CFG_USERNAME", username.as_str()).env("GSE_CFG_PASSWORD", password.as_str());
             GENERATE_EMU_CONFIG_TIMEOUT_AUTH
         }
     };
@@ -720,6 +836,68 @@ mod tests {
         assert_eq!(generate_interfaces(dir.path(), Arch::X64, &dll).unwrap(), false);
     }
 
+    #[test]
+    fn mirror_dir_recursive_copies_nested_files() {
+        let src = TempDir::new().unwrap();
+        touch(&src.path().join("a.txt"), b"a");
+        touch(&src.path().join("sub/b.txt"), b"b");
+
+        let dst_parent = TempDir::new().unwrap();
+        let dst = dst_parent.path().join("mirror");
+        mirror_dir_recursive(src.path(), &dst).unwrap();
+
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dst.join("sub/b.txt")).unwrap(), b"b");
+    }
+
+    #[test]
+    fn ensure_mirror_at_skips_rebuild_when_source_is_unchanged() {
+        let source = TempDir::new().unwrap();
+        touch(&source.path().join("generate_emu_config.exe"), b"v1");
+        let mirror_parent = TempDir::new().unwrap();
+        let mirror = mirror_parent.path().join("mirror");
+
+        ensure_mirror_at(source.path(), &mirror).unwrap();
+        assert_eq!(std::fs::read(mirror.join("generate_emu_config.exe")).unwrap(), b"v1");
+
+        // A naive unconditional rebuild would wipe this; an unchanged source
+        // stamp must leave the mirror (and anything a real run wrote into
+        // it) alone.
+        std::fs::write(mirror.join("marker.txt"), b"still here").unwrap();
+        ensure_mirror_at(source.path(), &mirror).unwrap();
+        assert!(mirror.join("marker.txt").is_file());
+    }
+
+    #[test]
+    fn ensure_mirror_at_rebuilds_and_preserves_refresh_tokens_when_source_changes() {
+        let source = TempDir::new().unwrap();
+        let exe_path = source.path().join("generate_emu_config.exe");
+        touch(&exe_path, b"v1");
+        let mirror_parent = TempDir::new().unwrap();
+        let mirror = mirror_parent.path().join("mirror");
+
+        ensure_mirror_at(source.path(), &mirror).unwrap();
+        std::fs::write(mirror.join("refresh_tokens.json"), b"cached-session").unwrap();
+
+        // Simulate an AutoGSE upgrade shipping a newer vendored tool build —
+        // the differing size alone is enough to change `mirror_source_stamp`.
+        std::fs::write(&exe_path, b"v2-longer-content").unwrap();
+        ensure_mirror_at(source.path(), &mirror).unwrap();
+
+        assert_eq!(std::fs::read(mirror.join("generate_emu_config.exe")).unwrap(), b"v2-longer-content");
+        assert_eq!(
+            std::fs::read(mirror.join("refresh_tokens.json")).unwrap(),
+            b"cached-session",
+            "a real cached login session must survive a mirror rebuild, not force a silent re-login"
+        );
+    }
+
+    #[test]
+    fn writable_tools_root_is_under_the_real_autogse_local_appdata_dir() {
+        let root = writable_tools_root().unwrap();
+        assert!(root.ends_with("AutoGSE/gen_emu_cfg_cache") || root.ends_with("AutoGSE\\gen_emu_cfg_cache"));
+    }
+
     /// Manual QA only (live, requires a real Steam game's original DLL, set
     /// via `AUTOGSE_TEST_DLL_PATH`, e.g. a `steam_api64.dll` copied out of an
     /// installed game before AutoGSE ever touches it):
@@ -815,5 +993,30 @@ mod tests {
         run_generate_emu_config(105600, out_dir.path(), &AuthMode::Authenticated { username, password }, GenOptions::default()).unwrap(); // 105600 = Terraria
         assert!(out_dir.path().join("steam_settings/achievements.json").is_file());
         assert!(out_dir.path().join("steam_settings/img").is_dir());
+    }
+
+    /// Manual QA only — this phase's actual exit criterion (Cheevos
+    /// integration roadmap Phase 3): two consecutive authenticated runs
+    /// against different App IDs should only prompt for a Steam Guard code
+    /// on the first. Watch the console output by hand for that — it can't be
+    /// asserted programmatically — this only asserts the mechanical part:
+    /// `-tok` actually left a real cached session in the writable mirror
+    /// after the first run.
+    /// `cargo test goldberg::tests::live_run_generate_emu_config_authenticated_reuses_session -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn live_run_generate_emu_config_authenticated_reuses_session() {
+        let username = SecretString::new(std::env::var("AUTOGSE_TEST_STEAM_USERNAME").expect("set AUTOGSE_TEST_STEAM_USERNAME"));
+        let password = SecretString::new(std::env::var("AUTOGSE_TEST_STEAM_PASSWORD").expect("set AUTOGSE_TEST_STEAM_PASSWORD"));
+        let auth = AuthMode::Authenticated { username, password };
+
+        let out_dir_1 = TempDir::new().unwrap();
+        run_generate_emu_config(480, out_dir_1.path(), &auth, GenOptions::default()).unwrap(); // 480 = Spacewar
+        let refresh_tokens = writable_tools_root().unwrap().join("refresh_tokens.json");
+        assert!(refresh_tokens.is_file(), "-tok should have cached a session in the writable mirror after the first login");
+
+        let out_dir_2 = TempDir::new().unwrap();
+        run_generate_emu_config(105600, out_dir_2.path(), &auth, GenOptions::default()).unwrap(); // 105600 = Terraria
+        assert!(out_dir_2.path().join("steam_settings/achievements.json").is_file());
     }
 }

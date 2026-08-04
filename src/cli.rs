@@ -32,10 +32,10 @@ pub enum Command {
     /// Store Steam login credentials so future injections include
     /// achievement data. Without this, AutoGSE runs anonymously and skips
     /// achievement names/descriptions/icons.
-    Login,
+    Login(LoginArgs),
 
     /// Remove stored Steam login credentials (reverts to anonymous mode).
-    Logout,
+    Logout(LogoutArgs),
 
     /// Store RetroAchievements.org login credentials (username + Web API
     /// key) for the achievement viewer's RetroAchievements panel (§7.7). A
@@ -104,10 +104,10 @@ pub enum Command {
     Audit(AuditArgs),
 
     /// Dump environment/tooling diagnostics (vendored tools resolution,
-    /// DPAPI store reachability, recent log tail, known-target count) for
-    /// troubleshooting — a failure otherwise is only ever visible in one
-    /// console/toast and then gone.
-    Doctor,
+    /// DPAPI store reachability, recent log tail, known-target count,
+    /// whether a Steam login is stored) for troubleshooting — a failure
+    /// otherwise is only ever visible in one console/toast and then gone.
+    Doctor(DoctorArgs),
 
     /// Check GitHub releases for a newer AutoGSE version. Opt-in only:
     /// never runs automatically, never auto-downloads anything — just
@@ -247,6 +247,11 @@ pub struct ReinjectArgs {
     /// whose steam_api(64).dll a Steam update reverted to vanilla.
     #[arg(long)]
     pub path: PathBuf,
+
+    /// Emit a JSON object instead of human-readable lines — see `scan
+    /// --json`'s doc comment for the shared rationale.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -254,6 +259,28 @@ pub struct RepairArgs {
     /// The game folder to diagnose (and, where safely possible, fix).
     #[arg(long)]
     pub path: PathBuf,
+
+    /// Emit a JSON object instead of human-readable lines — see `scan
+    /// --json`'s doc comment for the shared rationale.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct LoginArgs {
+    /// Emit a JSON object instead of human-readable lines — see `scan
+    /// --json`'s doc comment for the shared rationale. Never includes the
+    /// password (see `doctor --json`'s `logged_in_as` for the same rule).
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct LogoutArgs {
+    /// Emit a JSON object instead of human-readable lines — see `scan
+    /// --json`'s doc comment for the shared rationale.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::Args, Debug, Clone)]
@@ -375,6 +402,15 @@ pub struct ScanArgs {
     /// Emit a JSON array instead of human-readable lines — the stable,
     /// scriptable contract external tooling (Phase 11 §11.4's Playnite
     /// plugin) integrates against instead of parsing console text.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(clap::Args, Debug, Clone)]
+pub struct DoctorArgs {
+    /// Emit a JSON object instead of human-readable lines — same contract
+    /// shape as `scan --json`/`list --json`, for companion tooling (e.g.
+    /// Cheevos) that needs structured status rather than console text.
     #[arg(long)]
     pub json: bool,
 }
@@ -605,6 +641,13 @@ pub struct TargetArgs {
     /// preview, not an offline one.
     #[arg(long = "dry-run")]
     pub dry_run: bool,
+
+    /// Emit a JSON object (or array, for `--root` batch runs) instead of
+    /// human-readable lines — see `scan --json`'s doc comment for the shared
+    /// rationale. Suppresses all `[AutoGSE] ...` info lines this run would
+    /// otherwise print; warnings still go to stderr as plain text.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq, Default)]
