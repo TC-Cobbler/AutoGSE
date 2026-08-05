@@ -1,0 +1,73 @@
+{
+  "format": 1,
+  "restore": {
+    "G:\\Other computers\\My PC\\TheCmpny\\001_CompanyProjects\\006_Cobbler\\003_FossApps\\AutoGSE\\playnite-plugin\\AutoGSEPlaynitePlugin.csproj": {}
+  },
+  "projects": {
+    "G:\\Other computers\\My PC\\TheCmpny\\001_CompanyProjects\\006_Cobbler\\003_FossApps\\AutoGSE\\playnite-plugin\\AutoGSEPlaynitePlugin.csproj": {
+      "version": "1.0.0",
+      "restore": {
+        "projectUniqueName": "G:\\Other computers\\My PC\\TheCmpny\\001_CompanyProjects\\006_Cobbler\\003_FossApps\\AutoGSE\\playnite-plugin\\AutoGSEPlaynitePlugin.csproj",
+        "projectName": "AutoGSEPlaynitePlugin",
+        "projectPath": "G:\\Other computers\\My PC\\TheCmpny\\001_CompanyProjects\\006_Cobbler\\003_FossApps\\AutoGSE\\playnite-plugin\\AutoGSEPlaynitePlugin.csproj",
+        "packagesPath": "C:\\Users\\Johnny\\.nuget\\packages\\",
+        "outputPath": "G:\\Other computers\\My PC\\TheCmpny\\001_CompanyProjects\\006_Cobbler\\003_FossApps\\AutoGSE\\playnite-plugin\\obj\\",
+        "projectStyle": "PackageReference",
+        "fallbackFolders": [
+          "C:\\Program Files (x86)\\Microsoft Visual Studio\\Shared\\NuGetPackages"
+        ],
+        "configFilePaths": [
+          "C:\\Users\\Johnny\\AppData\\Roaming\\NuGet\\NuGet.Config",
+          "C:\\Program Files (x86)\\NuGet\\Config\\Microsoft.VisualStudio.FallbackLocation.config"
+        ],
+        "originalTargetFrameworks": [
+          "net462"
+        ],
+        "sources": {
+          "https://api.nuget.org/v3/index.json": {}
+        },
+        "frameworks": {
+          "net462": {
+            "framework": "net462",
+            "targetAlias": "net462",
+            "projectReferences": {}
+          }
+        },
+        "warningProperties": {
+          "warnAsError": [
+            "NU1605"
+          ]
+        },
+        "restoreAuditProperties": {
+          "enableAudit": "true",
+          "auditLevel": "low",
+          "auditMode": "direct"
+        },
+        "SdkAnalysisLevel": "10.0.300"
+      },
+      "frameworks": {
+        "net462": {
+          "framework": "net462",
+          "targetAlias": "net462",
+          "dependencies": {
+            "Microsoft.NETFramework.ReferenceAssemblies": {
+              "suppressParent": "All",
+              "target": "Package",
+              "version": "[1.0.3, )",
+              "autoReferenced": true
+            },
+            "PlayniteSDK": {
+              "target": "Package",
+              "version": "[6.11.0, )"
+            },
+            "System.Text.Json": {
+              "target": "Package",
+              "version": "[8.0.5, )"
+            }
+          },
+          "runtimeIdentifierGraphPath": "C:\\Program Files\\dotnet\\sdk\\10.0.302\\RuntimeIdentifierGraph.json"
+        }
+      }
+    }
+  }
+}

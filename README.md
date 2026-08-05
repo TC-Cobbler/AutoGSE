@@ -1,14 +1,14 @@
 # AutoGSE
 
-A Windows CLI and Explorer context-menu tool that automates injecting the [Goldberg Steam Emulator](https://github.com/alex47exe/gse_fork) (`gse_fork` by alex47exe) into non-Steam game installs, so offline/cracked/DRM-free games can track achievements locally (and via Achievement Watcher).
+A Windows CLI (with an Explorer right-click menu on top) that injects the [Goldberg Steam Emulator](https://github.com/alex47exe/gse_fork) (`gse_fork` by alex47exe) into non-Steam game installs, so your offline, cracked, or otherwise DRM-free games can still track achievements locally — and show up in Achievement Watcher.
 
-Right-click a game's `.exe` or its folder → **Inject** or **Revert**. AutoGSE finds the right `steam_api(64).dll`, figures out the Steam App ID, runs the Goldberg config tooling, and writes an atomic manifest so the revert is always a clean, deterministic rollback.
+Right-click a game's `.exe` or its folder and pick **Inject** or **Revert**. AutoGSE works out which `steam_api(64).dll` you need, figures out the Steam App ID, runs the Goldberg config tooling, and writes a manifest as it goes so `Revert` can always put things back exactly the way they were.
 
 ## Standalone vs. with Cheevos
 
-AutoGSE works entirely on its own — install it and the Explorer context menu is all you need. It has no dependency on any other app: `Inject`/`Revert` call `autogse.exe` directly, with no network requirement beyond Steam itself.
+You don't need anything else to use AutoGSE — install it and the Explorer context menu is all there is to it. `Inject`/`Revert` just call `autogse.exe` directly, no other app involved, no network requirement beyond Steam itself.
 
-Separately, [Cheevos](https://github.com/TC-Cobbler/Cheevos) (a companion fork of PSerban93/Achievements) can drive AutoGSE as a subprocess for a full library dashboard — scanning, injecting, auditing, and exporting achievement data across your whole games folder from one UI, instead of one right-click at a time. It's optional: everything Cheevos does goes through the same `autogse.exe` CLI documented below, and nothing in AutoGSE requires Cheevos to function. See [`roadmap-cheevos-integration.md`](roadmap-cheevos-integration.md) if you want that.
+If you'd rather manage a whole library instead of one right-click at a time, [Cheevos](https://github.com/TC-Cobbler/Cheevos) (a companion fork of PSerban93/Achievements) drives AutoGSE as a subprocess and wraps it in a dashboard — scanning, injecting, auditing, and exporting achievement data across your whole games folder from one UI. It's entirely optional and goes through the same `autogse.exe` CLI documented below; AutoGSE itself has no idea Cheevos exists. See [`roadmap-cheevos-integration.md`](roadmap-cheevos-integration.md) if you're curious how that split came about.
 
 ## Features
 
@@ -32,7 +32,7 @@ Separately, [Cheevos](https://github.com/TC-Cobbler/Cheevos) (a companion fork o
 
 ## Installing
 
-Run the InnoSetup installer (`dist/AutoGSE-Setup-*.exe`, built from `installer/autogse.iss`). It installs to `Program Files`, registers the context-menu entries, and creates the Start Menu shortcut toast notifications require. Uninstalling removes all three cleanly.
+Run the installer (built from the Inno Setup script at `installer/autogse.iss`). It installs to `Program Files`, registers the context-menu entries, and creates the Start Menu shortcut that toast notifications need to work. Uninstalling takes all three back out cleanly.
 
 ## Usage
 
@@ -60,21 +60,21 @@ See [`CONTRACT.md`](CONTRACT.md) for the complete subcommand list (including hid
 
 ## Steam credentials: why not just an API key?
 
-AutoGSE asks for your actual Steam username/password rather than a Steam Web API key, and that's a real, deliberate constraint, not an oversight:
+AutoGSE asks for your actual Steam username and password instead of a Web API key. That's on purpose, not laziness — here's why:
 
-- Full achievement data (names, descriptions, icons, and Achievement Watcher schemas) comes from the vendored `generate_emu_config` tool's `-acw`/`-tok` flags, which talk to **Steam's internal Connection Manager protocol** (the real Steam client login protocol, TCP port 27017) — not the public HTTPS Web API. That data is genuinely unavailable to an anonymous session or a plain API key; only a real authenticated login unlocks it.
-- Separately, Valve's public `ISteamApps/GetAppList/v2` endpoint (which a Web API key *would* unlock) is deprecated. AutoGSE's own App ID fuzzy-matching step avoids needing a key at all by using the unauthenticated `store.steampowered.com/api/storesearch` endpoint instead — so a Web API key wouldn't even help there.
-- Credentials are DPAPI-encrypted and stored only on your machine (`%LOCALAPPDATA%\AutoGSE\credentials.dat`), tied to your Windows user + machine automatically. They're never written to a plaintext file, never sent anywhere except to Steam itself, and the `login` subcommand deliberately has no `--username`/`--password` flags so they can't end up in shell history or Explorer's "Recent commands."
-- `--anon` (or declining the first-run prompt) skips all of this — injection, DLC/mod config, and everything else that doesn't need achievement metadata works fully anonymously.
+- Full achievement data (names, descriptions, icons, and Achievement Watcher schemas) comes from the vendored `generate_emu_config` tool's `-acw`/`-tok` flags, which talk to **Steam's internal Connection Manager protocol** (the real Steam client login protocol, over TCP port 27017), not the public HTTPS Web API. That data just isn't reachable from an anonymous session or a plain API key — only a real authenticated login gets you there.
+- On top of that, the public `ISteamApps/GetAppList/v2` endpoint a Web API key would normally unlock is deprecated anyway. AutoGSE's App ID fuzzy-matching sidesteps the need for a key entirely by hitting the unauthenticated `store.steampowered.com/api/storesearch` endpoint instead, so a key wouldn't buy you anything there either.
+- Your credentials are DPAPI-encrypted and never leave your machine (`%LOCALAPPDATA%\AutoGSE\credentials.dat`), tied automatically to your Windows user and this PC. They're never written to disk in plaintext, never sent anywhere but Steam, and the `login` subcommand has no `--username`/`--password` flags on purpose, so they can't end up sitting in your shell history or Explorer's "Recent commands."
+- Don't want to log in at all? `--anon` (or just declining the first-run prompt) skips all of this. Injection, DLC/mod config, and everything else that doesn't need achievement metadata still works fine anonymously.
 
 ## How it works
 
-1. **Discover** — resolve the target directory and DLL from the path given, verify 32/64-bit via the PE header.
-2. **Identify** — resolve the Steam App ID via `steam_appid.txt` → PE metadata → fuzzy name match → interactive prompt.
-3. **Back up** — rename `steam_api(64).dll` → `.org`, hash it.
-4. **Generate** — invoke the vendored `generate_emu_config` tooling (anonymous or authenticated) to build `steam_settings/` (`configs.*.ini`, achievements, interfaces).
-5. **Inject** — copy the Goldberg emulator DLL into place, write `steam_appid.txt` and `steam_settings/`.
-6. **Record** — write `.gse_manifest.json` listing every backed-up and injected file with hashes, so `revert` is exact and idempotent.
+1. **Discover** — resolve the target directory and DLL from the path you gave it, verify 32/64-bit via the PE header.
+2. **Identify** — work out the Steam App ID, trying `steam_appid.txt`, then PE metadata, then a fuzzy name match, then falling back to an interactive prompt if nothing else worked.
+3. **Back up** — rename `steam_api(64).dll` to `.org` and hash it.
+4. **Generate** — run the vendored `generate_emu_config` tooling (anonymous or authenticated) to build `steam_settings/` (`configs.*.ini`, achievements, interfaces).
+5. **Inject** — drop the Goldberg emulator DLL into place, write `steam_appid.txt` and `steam_settings/`.
+6. **Record** — write `.gse_manifest.json` listing every backed-up and injected file along with hashes, so `revert` can undo it exactly, every time.
 
 ## Building from source
 
@@ -90,8 +90,8 @@ The release binary targets < 15 MB and statically links the MSVC CRT. `installer
 
 ## Project status
 
-`v1.0.0` — the core engine, full GSE feature coverage (controller/mods/DLC, LAN/multiplayer, save sync, portable export/import, anti-cheat scanning, SteamStub unpacking), shell integration, and the Cheevos companion `--json` contract are all done and considered stable. See [`roadmap.md`](roadmap.md) for AutoGSE's own phase-by-phase history against the [PRD](AutoGSE_Product_Requirement_Document.md), and [`roadmap-cheevos-integration.md`](roadmap-cheevos-integration.md) for the Cheevos companion-app story. New user-facing features (overlays, playtime tracking, rarity metrics, store/launcher integrations, any GUI) are no longer planned in AutoGSE itself — that surface belongs to Cheevos now; `roadmap.md`'s own top-of-file notice explains why.
+`v1.0.0` — the core engine, full GSE feature coverage (controller/mods/DLC, LAN/multiplayer, save sync, portable export/import, anti-cheat scanning, SteamStub unpacking), shell integration, and the Cheevos companion `--json` contract are all done and considered stable. New user-facing features (overlays, playtime tracking, rarity metrics, store/launcher integrations, any GUI) aren't planned for AutoGSE itself anymore — that surface belongs to Cheevos now. See [`roadmap-cheevos-integration.md`](roadmap-cheevos-integration.md) for how that split came about.
 
 ## Credits
 
-AutoGSE bundles and wraps [`gse_fork`](https://github.com/alex47exe/gse_fork) by alex47exe, itself built on [Mr_Goldberg's Steam emulator](https://gitlab.com/Mr_Goldberg/goldberg_emulator). AutoGSE does not modify or relicense that tooling — see `installer/ATTRIBUTION.txt`. Review `gse_fork`'s own license before redistributing.
+AutoGSE bundles and wraps [`gse_fork`](https://github.com/alex47exe/gse_fork) by alex47exe, itself built on [Mr_Goldberg's Steam emulator](https://gitlab.com/Mr_Goldberg/goldberg_emulator). AutoGSE doesn't modify or relicense that tooling — see `installer/ATTRIBUTION.txt` — and you should check `gse_fork`'s own license before redistributing anything.
